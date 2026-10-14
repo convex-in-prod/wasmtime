@@ -1,7 +1,7 @@
 use crate::TRAP_INTERNAL_ASSERT;
 use crate::alias_region::AliasRegions;
 use crate::debug::DwarfSectionRelocTarget;
-use crate::func_environ::FuncEnvironment;
+use crate::func_environ::{BuiltinFunctions, FuncEnvironment, emit_epoch_check_at_boundary};
 use crate::translate::{FuncTranslator, VmctxLoadChain};
 use crate::{BuiltinFunctionSignatures, builder::LinkOptions, wasm_call_signature};
 use crate::{CompiledFunction, ModuleTextBuilder, array_call_signature};
@@ -297,7 +297,7 @@ impl Compiler {
         let succeeded = builder.func.dfg.inst_results(call)[0];
         self.raise_if_host_trapped(&mut builder, &mut alias_regions, caller_vmctx, succeeded);
 
-        // Return results from the array as native return values.
+        // Load host results before any callback that may collect garbage.
         let results = self.load_values_from_array(
             &mut alias_regions,
             wasm_func_ty.results(),
@@ -305,6 +305,29 @@ impl Compiler {
             args_base,
             args_len,
         );
+        if self.tunables.fuel_epoch_poll_interval != 0 {
+            for (value, ty) in results.iter().zip(wasm_func_ty.results()) {
+                if let WasmValType::Ref(reference) = ty
+                    && reference.heap_type.is_vmgcref_type_and_not_i31()
+                    && !reference.heap_type.is_bottom()
+                {
+                    builder.declare_value_needs_stack_map(*value);
+                }
+            }
+        }
+
+        if self.tunables.fuel_epoch_poll_interval != 0 {
+            // Host calls may consume wall time or suspend without using fuel.
+            // Check before returning their results to the guest continuation.
+            let mut builtins = BuiltinFunctions::new(self);
+            emit_epoch_check_at_boundary(
+                &mut builder,
+                &mut alias_regions,
+                &mut builtins,
+                caller_vmctx,
+            );
+        }
+
         builder.ins().return_(&results);
         builder.finalize(self.isa().frontend_config());
         crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(

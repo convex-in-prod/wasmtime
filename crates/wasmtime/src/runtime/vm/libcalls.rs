@@ -732,17 +732,25 @@ fn memory_atomic_wait64(
 }
 
 // Hook for when an instance runs out of fuel.
-fn out_of_gas(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+fn out_of_gas(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
     block_on!(store, async |store, _| {
         if !store.refuel() {
-            return Err(Trap::OutOfFuel.into());
+            return Err::<(), crate::Error>(Trap::OutOfFuel.into());
         }
         #[cfg(feature = "async")]
         if store.fuel_yield_interval.is_some() {
             store.yield_now().await;
         }
         Ok(())
-    })?
+    })??;
+    #[cfg(target_has_atomic = "64")]
+    if store.fuel_epoch_poll_interval.is_some() {
+        let now = store.engine().current_epoch();
+        if now >= store.get_epoch_deadline() {
+            new_epoch(store, instance)?;
+        }
+    }
+    Ok(())
 }
 
 // Hook for when an instance observes that the epoch has changed.

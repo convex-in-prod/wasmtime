@@ -790,6 +790,33 @@ impl Config {
         self
     }
 
+    /// Schedules internal epoch checks at bounded fuel refills.
+    ///
+    /// A nonzero interval replaces epoch checks at private function entries and
+    /// loop headers with checks when the active fuel slice is refilled. Checks
+    /// remain at native or escaping entries, module startup, successful host
+    /// returns, and exception catch continuations. Stores inherit the interval
+    /// from their engine. Existing deadline callbacks, including async yields,
+    /// still run when an epoch check observes an expired deadline.
+    ///
+    /// The interval bounds fuel slices, not elapsed time: individual operations
+    /// and host calls have variable cost, and a straight-line block can exceed
+    /// a slice before reaching the next fuel checkpoint. Total fuel accounting
+    /// and exhaustion behavior are unchanged.
+    ///
+    /// Zero (the default) retains ordinary epoch instrumentation. Native artifacts
+    /// still require this revision's ABI. Nonzero intervals also require matching
+    /// producer and consumer configuration; older runtimes reject these artifacts.
+    ///
+    /// This mode requires fuel consumption, epoch interruption, and default
+    /// operator costs. This mode supports core modules. Components, stack
+    /// switching, shared-memory threads, guest debugging, recording, and
+    /// separately configured async fuel yields are not supported.
+    pub fn fuel_epoch_poll_interval(&mut self, interval: u64) -> &mut Self {
+        self.tunables.fuel_epoch_poll_interval = Some(interval);
+        self
+    }
+
     /// XXX: For internal fuzzing and debugging use only!
     #[doc(hidden)]
     pub fn gc_zeal_alloc_counter(&mut self, counter: Option<NonZeroU32>) -> Result<&mut Self> {
@@ -2798,6 +2825,41 @@ impl Config {
         }
 
         self.tunables.configure(&mut tunables);
+        if tunables.fuel_epoch_poll_interval != 0 {
+            crate::ensure!(
+                tunables.consume_fuel && tunables.epoch_interruption,
+                "fuel-scheduled epoch polling requires fuel and epoch instrumentation"
+            );
+            crate::ensure!(
+                matches!(
+                    tunables.operator_cost,
+                    wasmtime_environ::OperatorCostStrategy::Default
+                ),
+                "fuel-scheduled epoch polling requires default operator costs"
+            );
+            crate::ensure!(
+                !features.contains(WasmFeatures::STACK_SWITCHING),
+                "fuel-scheduled epoch polling does not support stack switching"
+            );
+            crate::ensure!(
+                !features.contains(WasmFeatures::THREADS),
+                "fuel-scheduled epoch polling does not support shared-memory threads"
+            );
+            // Component lowerings use separate host-call trampolines. They do
+            // not yet provide the continuation checks required by this mode.
+            crate::ensure!(
+                !features.contains(WasmFeatures::COMPONENT_MODEL),
+                "fuel-scheduled epoch polling does not support components"
+            );
+            crate::ensure!(
+                !tunables.debug_guest,
+                "fuel-scheduled epoch polling does not support guest debugging"
+            );
+            crate::ensure!(
+                !tunables.concurrency_support && !tunables.recording,
+                "fuel-scheduled epoch polling does not support component concurrency or recording"
+            );
+        }
 
         // If no GC heap tunables are explicitly configured, copy the memory
         // tunables' configured values so that GC heaps default to the same

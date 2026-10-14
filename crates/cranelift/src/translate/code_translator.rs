@@ -4654,6 +4654,7 @@ fn create_catch_block(
     if needs_stack_map {
         builder.declare_value_needs_stack_map(exn_ref);
     }
+    environ.translate_exception_poll(builder);
 
     // We encode tag indices from the module directly as Cranelift
     // `ExceptionTag`s. We will translate those to (instance,

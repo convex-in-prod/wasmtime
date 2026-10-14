@@ -110,8 +110,20 @@ impl BuiltinFunctions {
         if let Some(f) = cache {
             return *f;
         }
-        let signature = func.import_signature(self.types.wasm_signature(builtin));
-        let key = FuncKey::WasmToBuiltinTrampoline(builtin);
+        let mut signature = self.types.wasm_signature(builtin);
+        let key = if builtin == BuiltinFunctionIndex::out_of_gas()
+            || builtin == BuiltinFunctionIndex::new_epoch()
+        {
+            // Preserve live registers inside these uncommon handlers instead of
+            // making every instrumented caller accommodate their clobbers. Their
+            // updated fuel and epoch deadline are reloaded from the store.
+            signature.returns.clear();
+            signature.call_conv = CallConv::PreserveAll;
+            FuncKey::PatchableToBuiltinTrampoline(builtin)
+        } else {
+            FuncKey::WasmToBuiltinTrampoline(builtin)
+        };
+        let signature = func.import_signature(signature);
         let (namespace, index) = key.into_raw_parts();
         let name = ir::ExternalName::User(
             func.declare_imported_user_function(ir::UserExternalName { namespace, index }),
@@ -166,6 +178,46 @@ macro_rules! declare_function_signatures {
 }
 wasmtime_environ::foreach_builtin_function!(declare_function_signatures);
 
+// Continuations after host work cannot reuse a cached deadline or wait for
+// another fuel slice. All live GC references must already be in stack maps.
+pub(crate) fn emit_epoch_check_at_boundary<O: wasmtime_environ::GetPtrSize>(
+    builder: &mut FunctionBuilder<'_>,
+    alias_regions: &mut AliasRegions<O>,
+    builtins: &mut BuiltinFunctions,
+    vmctx: ir::Value,
+) {
+    let epoch_ptr = alias_regions
+        .vmctx()
+        .epoch_ptr()
+        .load(&mut builder.cursor(), vmctx);
+    let epoch = alias_regions
+        .vmctx()
+        .epoch_counter()
+        .load(&mut builder.cursor(), epoch_ptr);
+    let context = alias_regions
+        .vmctx()
+        .store_context()
+        .load(&mut builder.cursor(), vmctx);
+    let deadline = alias_regions
+        .vm_store_context()
+        .epoch_deadline()
+        .load(&mut builder.cursor(), context);
+    let expired = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, epoch, deadline);
+    let poll = builder.create_block();
+    let resume = builder.create_block();
+    builder.set_cold_block(poll);
+    builder.ins().brif(expired, poll, &[], resume, &[]);
+    builder.seal_block(poll);
+    builder.switch_to_block(poll);
+    let new_epoch = builtins.new_epoch(builder.func);
+    builder.ins().call(new_epoch, &[vmctx]);
+    builder.ins().jump(resume, &[]);
+    builder.seal_block(resume);
+    builder.switch_to_block(resume);
+}
+
 /// The `FuncEnvironment` implementation for use by the `ModuleEnvironment`.
 pub struct FuncEnvironment<'module_environment> {
     compiler: &'module_environment Compiler,
@@ -211,6 +263,7 @@ pub struct FuncEnvironment<'module_environment> {
     pub(crate) offsets: VMOffsets<u8>,
 
     tunables: &'module_environment Tunables,
+    epoch_entry_required: bool,
 
     /// A function-local variable which stores the cached value of the amount of
     /// fuel remaining to execute. If used this is modified frequently so it's
@@ -311,6 +364,8 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             builtin_functions,
             offsets,
             tunables,
+            epoch_entry_required: func_index
+                .is_none_or(|index| translation.module.functions[index].is_escaping()),
             fuel_var: Variable::reserved_value(),
             epoch_deadline_var: Variable::reserved_value(),
             epoch_ptr_var: Variable::reserved_value(),
@@ -740,6 +795,22 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         }
     }
 
+    pub(crate) fn translate_exception_poll(&mut self, builder: &mut FunctionBuilder<'_>) {
+        if self.tunables.fuel_epoch_poll_interval != 0 {
+            // A host exception bypasses the successful host-return trampoline.
+            // Catch lowering has rooted its exception reference before this call.
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            emit_epoch_check_at_boundary(
+                builder,
+                &mut self.alias_regions,
+                &mut self.builtin_functions,
+                vmctx,
+            );
+            // Catch entry already reloaded fuel. StoreHookState prevents epoch
+            // callbacks from changing that fuel or reentering the guest.
+        }
+    }
+
     /// Adds `self.fuel_consumed` to the `fuel_var`, zero-ing out the amount of
     /// fuel consumed at that point.
     fn fuel_increment_var(&mut self, builder: &mut FunctionBuilder<'_>) {
@@ -781,6 +852,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
     fn fuel_check(&mut self, builder: &mut FunctionBuilder) {
         self.fuel_increment_var(builder);
         let out_of_gas_block = builder.create_block();
+        builder.set_cold_block(out_of_gas_block);
         let continuation_block = builder.create_block();
 
         // Note that our fuel is encoded as adding positive values to a
@@ -962,10 +1034,14 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
 
         let new_epoch = self.builtin_functions.new_epoch(builder.func);
         let vmctx = self.vmctx_val(&mut builder.cursor());
-        // new_epoch() returns the new deadline, so we don't have to
-        // reload it.
-        let call = builder.ins().call(new_epoch, &[vmctx]);
-        let new_deadline = *builder.func.dfg.inst_results(call).first().unwrap();
+        // The preserving trampoline has no return registers. The host commits
+        // the new deadline before returning, including after an async yield.
+        builder.ins().call(new_epoch, &[vmctx]);
+        let new_deadline = self
+            .alias_regions
+            .vm_store_context()
+            .epoch_deadline()
+            .load(&mut builder.cursor(), vmstore_ctx);
         builder.def_var(self.epoch_deadline_var, new_deadline);
         builder.ins().jump(continuation_block, &[]);
         builder.seal_block(continuation_block);
@@ -5316,7 +5392,7 @@ impl FuncEnvironment<'_> {
 
         // If we are performing epoch-based interruption, check to see
         // if the epoch counter has changed.
-        if self.tunables.epoch_interruption {
+        if self.tunables.epoch_interruption && self.tunables.fuel_epoch_poll_interval == 0 {
             self.epoch_check(builder);
         }
     }
@@ -5404,7 +5480,9 @@ impl FuncEnvironment<'_> {
         }
 
         // Initialize `epoch_var` with the current epoch.
-        if self.tunables.epoch_interruption {
+        if self.tunables.epoch_interruption
+            && (self.tunables.fuel_epoch_poll_interval == 0 || self.epoch_entry_required)
+        {
             self.epoch_function_entry(builder);
         }
 

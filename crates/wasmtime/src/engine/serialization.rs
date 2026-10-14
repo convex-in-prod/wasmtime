@@ -12,10 +12,11 @@
 //! Wasmtime AOT artifacts are ELF files so the data for the engine here is
 //! stored into a section of the output file. The structure of this section is:
 //!
-//! 1. A version byte, currently `VERSION`.
+//! 1. A version byte identifying the metadata layout.
 //! 2. A byte indicating how long the next field is.
 //! 3. A version string of the length of the previous byte value.
-//! 4. A `postcard`-encoded `Metadata` structure.
+//! 4. A `postcard`-encoded `Metadata` structure, followed by a nonzero fuel
+//!    interval for `FUEL_EPOCH_POLLING_VERSION`.
 //!
 //! This is hoped to help distinguish easily Wasmtime-based ELF files from
 //! other random ELF files, as well as provide better error messages for
@@ -36,7 +37,10 @@ use object::{
 use serde_derive::{Deserialize, Serialize};
 use wasmtime_environ::{FlagValue, ObjectKind, OperatorCostStrategy, Tunables, obj};
 
-const VERSION: u8 = 0;
+const LEGACY_VERSION: u8 = 0;
+// Older runtimes must reject artifacts that omit internal epoch checks, even
+// when the embedder disables the module version string check.
+const FUEL_EPOCH_POLLING_VERSION: u8 = 1;
 
 /// Verifies that the serialized engine in `mmap` is compatible with the
 /// `engine` provided.
@@ -102,7 +106,7 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
     let (first, data) = data
         .split_first()
         .ok_or_else(|| format_err!("invalid engine section"))?;
-    if *first != VERSION {
+    if !matches!(*first, LEGACY_VERSION | FUEL_EPOCH_POLLING_VERSION) {
         bail!("mismatched version in engine section");
     }
     let (len, data) = data
@@ -124,7 +128,20 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
             }
         }
     }
-    postcard::from_bytes::<Metadata<'_>>(data)?.check_compatible(engine)
+    let (mut metadata, remaining) = postcard::take_from_bytes::<Metadata<'_>>(data)?;
+    let remaining = if *first == FUEL_EPOCH_POLLING_VERSION {
+        let (interval, remaining) = postcard::take_from_bytes::<u64>(remaining)?;
+        ensure!(
+            interval != 0,
+            "fuel-scheduled epoch polling interval must be nonzero"
+        );
+        metadata.tunables.fuel_epoch_poll_interval = interval;
+        remaining
+    } else {
+        remaining
+    };
+    ensure!(remaining.is_empty(), "unexpected trailing engine metadata");
+    metadata.check_compatible(engine)
 }
 
 #[cfg(any(feature = "cranelift", feature = "winch"))]
@@ -135,7 +152,12 @@ pub fn append_compiler_info(engine: &Engine, obj: &mut Object<'_>, metadata: &Me
         object::SectionKind::ReadOnlyData,
     );
     let mut data = Vec::new();
-    data.push(VERSION);
+    let interval = metadata.tunables.fuel_epoch_poll_interval;
+    data.push(if interval == 0 {
+        LEGACY_VERSION
+    } else {
+        FUEL_EPOCH_POLLING_VERSION
+    });
     let version = engine.config().module_version.as_str();
     // This precondition is checked in Config::module_version:
     assert!(
@@ -145,6 +167,9 @@ pub fn append_compiler_info(engine: &Engine, obj: &mut Object<'_>, metadata: &Me
     data.push(version.len() as u8);
     data.extend_from_slice(version.as_bytes());
     data.extend(postcard::to_allocvec(metadata).unwrap());
+    if interval != 0 {
+        data.extend(postcard::to_allocvec(&interval).unwrap());
+    }
     obj.set_section_data(section, data, 1);
 }
 
@@ -303,6 +328,7 @@ impl Metadata<'_> {
             consume_fuel,
             ref operator_cost,
             epoch_interruption,
+            fuel_epoch_poll_interval,
             memory_may_move,
             guard_before_linear_memory,
             table_lazy_init,
@@ -376,6 +402,11 @@ impl Metadata<'_> {
         )?;
         Self::check_bool(consume_fuel, other.consume_fuel, "fuel support")?;
         Self::check_cost(consume_fuel, operator_cost, &other.operator_cost)?;
+        Self::check_int(
+            fuel_epoch_poll_interval,
+            other.fuel_epoch_poll_interval,
+            "fuel-scheduled epoch polling interval",
+        )?;
         Self::check_bool(
             epoch_interruption,
             other.epoch_interruption,

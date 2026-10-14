@@ -495,6 +495,7 @@ pub struct StoreOpaque {
     // until the reserve is empty.
     fuel_reserve: u64,
     pub(crate) fuel_yield_interval: Option<NonZeroU64>,
+    pub(crate) fuel_epoch_poll_interval: Option<NonZeroU64>,
     /// Indexed data within this `Store`, used to store information about
     /// globals, functions, memories, etc.
     store_data: StoreData,
@@ -748,6 +749,7 @@ impl<T> Store<T> {
             async_state: Default::default(),
             fuel_reserve: 0,
             fuel_yield_interval: None,
+            fuel_epoch_poll_interval: NonZeroU64::new(engine.tunables().fuel_epoch_poll_interval),
             store_data,
             traitobj: StorePtr(None),
             default_caller_vmctx: SendSyncPtr::new(NonNull::dangling()),
@@ -1910,7 +1912,7 @@ impl StoreOpaque {
         refuel(
             injected_fuel,
             &mut self.fuel_reserve,
-            self.fuel_yield_interval,
+            self.fuel_yield_interval.or(self.fuel_epoch_poll_interval),
         )
     }
 
@@ -1923,7 +1925,7 @@ impl StoreOpaque {
         set_fuel(
             injected_fuel,
             &mut self.fuel_reserve,
-            self.fuel_yield_interval,
+            self.fuel_yield_interval.or(self.fuel_epoch_poll_interval),
             fuel,
         );
         Ok(())
@@ -1938,6 +1940,11 @@ impl StoreOpaque {
         crate::ensure!(
             interval != Some(0),
             "fuel_async_yield_interval must not be 0"
+        );
+
+        crate::ensure!(
+            interval.is_none() || self.fuel_epoch_poll_interval.is_none(),
+            "async fuel yields do not combine with fuel-scheduled epoch polling"
         );
 
         // All future entrypoints must be async to handle the case that fuel
