@@ -2,6 +2,189 @@ use wasmtime::*;
 
 const WASM_PAGE_SIZE: usize = wasmtime_environ::Memory::DEFAULT_PAGE_SIZE as usize;
 
+#[derive(Default)]
+struct SeparateGcLimiter {
+    linear: Vec<(usize, usize)>,
+    gc: Vec<(usize, usize)>,
+    deny_gc: bool,
+}
+
+impl ResourceLimiter for SeparateGcLimiter {
+    fn memory_growing(&mut self, current: usize, desired: usize, _: Option<usize>) -> Result<bool> {
+        self.linear.push((current, desired));
+        Ok(true)
+    }
+
+    fn gc_heap_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _: Option<usize>,
+    ) -> Result<bool> {
+        self.gc.push((current, desired));
+        Ok(!self.deny_gc)
+    }
+
+    fn table_growing(&mut self, _: usize, _: usize, _: Option<usize>) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceLimiterAsync for SeparateGcLimiter {
+    async fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool> {
+        ResourceLimiter::memory_growing(self, current, desired, maximum)
+    }
+
+    async fn gc_heap_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool> {
+        ResourceLimiter::gc_heap_growing(self, current, desired, maximum)
+    }
+
+    async fn table_growing(&mut self, _: usize, _: usize, _: Option<usize>) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn limiter_distinguishes_internal_gc_from_linear_memory() -> Result<()> {
+    for asynchronous in [false, true] {
+        for pooling in [false, true] {
+            let mut config = Config::new();
+            config
+                .async_support(asynchronous)
+                .gc_heap_initial_size(WASM_PAGE_SIZE as u64);
+            if pooling {
+                let mut pool = crate::small_pool_config();
+                pool.max_memory_size(1024 * 1024)
+                    .total_memories(2)
+                    .total_gc_heaps(1);
+                config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+            }
+            let engine = Engine::new(&config)?;
+            let module = Module::new(
+                &engine,
+                r#"(module
+                (memory (export "memory") 1)
+                (type $a (array i32))
+                (func (export "allocate") (param i32) (result (ref $a))
+                    local.get 0 array.new_default $a))"#,
+            )?;
+            let mut store = Store::new(&engine, SeparateGcLimiter::default());
+            if asynchronous {
+                store.limiter_async(|limits| limits);
+            } else {
+                store.limiter(|limits| limits);
+            }
+            let instance = if asynchronous {
+                Instance::new_async(&mut store, &module, &[]).await?
+            } else {
+                Instance::new(&mut store, &module, &[])?
+            };
+            let memory = instance.get_memory(&mut store, "memory").unwrap();
+            if asynchronous {
+                memory.grow_async(&mut store, 1).await?;
+            } else {
+                memory.grow(&mut store, 1)?;
+            }
+            let allocate =
+                instance.get_typed_func::<u32, Rooted<ArrayRef>>(&mut store, "allocate")?;
+            for length in [1, WASM_PAGE_SIZE as u32] {
+                let array = if asynchronous {
+                    allocate.call_async(&mut store, length).await?
+                } else {
+                    allocate.call(&mut store, length)?
+                };
+                assert_eq!(array.len(&store)?, length);
+            }
+            assert_eq!(
+                store.data().linear,
+                [(0, WASM_PAGE_SIZE), (WASM_PAGE_SIZE, 2 * WASM_PAGE_SIZE)]
+            );
+            assert!(
+                store
+                    .data()
+                    .gc
+                    .iter()
+                    .any(|&(current, desired)| current == 0 && desired > 0)
+            );
+            assert!(
+                store
+                    .data()
+                    .gc
+                    .iter()
+                    .any(|&(current, desired)| current > 0 && desired > current)
+            );
+            store.data_mut().deny_gc = true;
+            let large = (store.gc_heap_capacity() / 4 + WASM_PAGE_SIZE) as u32;
+            let denied = if asynchronous {
+                allocate.call_async(&mut store, large).await
+            } else {
+                allocate.call(&mut store, large)
+            };
+            assert!(denied.is_err());
+            // Rejected GC growth must not change the linear-memory limit path.
+            if asynchronous {
+                memory.grow_async(&mut store, 1).await?;
+            } else {
+                memory.grow(&mut store, 1)?;
+            }
+            assert_eq!(store.data().linear.len(), 3);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn existing_limiter_still_receives_internal_gc_growth() -> Result<()> {
+    for asynchronous in [false, true] {
+        let mut config = Config::new();
+        config
+            .async_support(asynchronous)
+            .gc_heap_initial_size(WASM_PAGE_SIZE as u64);
+        let engine = Engine::new(&config)?;
+        let module = Module::new(
+            &engine,
+            r#"(module
+        (type $a (array i32))
+        (func (export "allocate") (param i32) (result (ref $a))
+            local.get 0 array.new_default $a))"#,
+        )?;
+        // Both FailureDetector implementations only override the original
+        // callback. The async version actually yields before accepting growth.
+        let mut store = Store::new(&engine, FailureDetector::default());
+        let instance = if asynchronous {
+            store.limiter_async(|limits| limits);
+            Instance::new_async(&mut store, &module, &[]).await?
+        } else {
+            store.limiter(|limits| limits);
+            Instance::new(&mut store, &module, &[])?
+        };
+        let allocate = instance.get_typed_func::<u32, Rooted<ArrayRef>>(&mut store, "allocate")?;
+        for length in [1, WASM_PAGE_SIZE as u32] {
+            if asynchronous {
+                allocate.call_async(&mut store, length).await?;
+            } else {
+                allocate.call(&mut store, length)?;
+            }
+        }
+        assert!(store.data().memory_current > 0);
+        assert!(store.data().memory_desired > store.data().memory_current);
+    }
+    Ok(())
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn test_limits() -> Result<()> {

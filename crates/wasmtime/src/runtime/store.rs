@@ -329,11 +329,22 @@ impl StoreResourceLimiter<'_> {
         current: usize,
         desired: usize,
         maximum: Option<usize>,
+        kind: wasmtime_environ::MemoryKind,
     ) -> Result<bool, Error> {
-        match self {
-            Self::Sync(s) => s.memory_growing(current, desired, maximum),
+        use wasmtime_environ::MemoryKind;
+        match (self, kind) {
+            (Self::Sync(s), MemoryKind::LinearMemory) => {
+                s.memory_growing(current, desired, maximum)
+            }
+            (Self::Sync(s), MemoryKind::GcHeap) => s.gc_heap_growing(current, desired, maximum),
             #[cfg(feature = "async")]
-            Self::Async(s) => s.memory_growing(current, desired, maximum).await,
+            (Self::Async(s), MemoryKind::LinearMemory) => {
+                s.memory_growing(current, desired, maximum).await
+            }
+            #[cfg(feature = "async")]
+            (Self::Async(s), MemoryKind::GcHeap) => {
+                s.gc_heap_growing(current, desired, maximum).await
+            }
         }
     }
 
@@ -430,6 +441,8 @@ impl<T> DerefMut for StoreInner<T> {
     }
 }
 
+pub(crate) type MemoryGrowHandler = dyn Fn(usize, usize, usize) -> bool + Send + Sync;
+
 /// Monomorphic storage for a `Store<T>`.
 ///
 /// This structure contains the bulk of the metadata about a `Store`. This is
@@ -471,6 +484,8 @@ pub struct StoreOpaque {
     instances: TryPrimaryMap<InstanceId, StoreInstance>,
 
     signal_handler: Option<SignalHandler>,
+    memory_write_handler: Option<Box<dyn Fn(usize, usize) -> bool + Send + Sync>>,
+    pub(crate) memory_grow_handler: Option<alloc::sync::Arc<MemoryGrowHandler>>,
     modules: ModuleRegistry,
     func_refs: FuncRefs,
     host_globals: TryPrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>>,
@@ -733,6 +748,8 @@ impl<T> Store<T> {
             continuations: Vec::new(),
             instances: TryPrimaryMap::new(),
             signal_handler: None,
+            memory_write_handler: None,
+            memory_grow_handler: None,
             gc_store: None,
             #[cfg(feature = "gc")]
             gc_data: Default::default(),
@@ -1800,6 +1817,38 @@ impl StoreOpaque {
     #[cfg(all(feature = "std", any(unix, windows)))]
     pub fn set_signal_handler(&mut self, handler: Option<SignalHandler>) {
         self.signal_handler = handler;
+    }
+
+    #[cfg(all(feature = "std", has_native_signals, unix))]
+    pub fn set_signal_handler_with_trap(&mut self, handler: SignalHandler) -> Result<()> {
+        self.modules.enable_signal_traps()?;
+        self.signal_handler = Some(handler);
+        Ok(())
+    }
+
+    #[cfg(all(feature = "std", has_native_signals, unix))]
+    pub fn set_memory_write_handler(
+        &mut self,
+        handler: Box<dyn Fn(usize, usize) -> bool + Send + Sync>,
+    ) {
+        self.memory_write_handler = Some(handler);
+    }
+
+    pub(crate) fn prepare_memory_write(
+        &self,
+        destination: *mut u8,
+        length: usize,
+    ) -> core::result::Result<(), wasmtime_environ::Trap> {
+        // An empty range cannot privatize a page, including a one-past-end range.
+        if length != 0
+            && self
+                .memory_write_handler
+                .as_ref()
+                .is_some_and(|handler| !handler(destination as usize, length))
+        {
+            return Err(wasmtime_environ::Trap::AllocationTooLarge);
+        }
+        Ok(())
     }
 
     #[inline]

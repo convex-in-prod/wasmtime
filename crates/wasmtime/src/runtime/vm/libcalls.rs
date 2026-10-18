@@ -10,12 +10,11 @@
 //! * They must only contain basic, raw i32/i64/f32/f64/pointer parameters that
 //!   are safe to pass across the system ABI.
 //!
-//! * If any nested function propagates an `Err(trap)` out to the library
-//!   function frame, we need to raise it. This involves some nasty and quite
-//!   unsafe code under the covers! Notably, after raising the trap, drops
-//!   **will not** be run for local variables! This can lead to things like
-//!   leaking `InstanceHandle`s which leads to never deallocating JIT code,
-//!   instances, and modules if we are not careful!
+//! * Fallible libcalls return through ordinary Rust frames, running their
+//!   destructors. The wrapper records the error or panic and returns a sentinel;
+//!   the generated trampoline then raises the trap after Rust has returned.
+//!   Never raise a signal-based trap from a native write: that would skip these
+//!   destructors.
 //!
 //! * The libcall must be entered via a Wasm-to-libcall trampoline that saves
 //!   the last Wasm FP and PC for stack walking purposes. (For more details, see
@@ -122,7 +121,7 @@ pub mod raw {
                 ) $(-> libcall!(@ty $result))? {
                     $(#[cfg($attr)])?
                     unsafe {
-                        Instance::enter_host_from_wasm(vmctx, |store, instance| {
+                        Instance::enter_host_from_wasm(vmctx, libcall!(@call_hooks $name), |store, instance| {
                             super::$name(store, instance, $($pname),*)
                         })
                     }
@@ -148,6 +147,13 @@ pub mod raw {
                 };
             )*
         };
+
+        // These operations already carry bounds-checked raw pointers. General
+        // call hooks may grow memory or move GC objects before those pointers
+        // are used. The write handler has an explicit no-reentry contract.
+        (@call_hooks memory_copy) => (false);
+        (@call_hooks memory_fill) => (false);
+        (@call_hooks $name:ident) => (true);
 
         (@ty u32) => (u32);
         (@ty u64) => (u64);
@@ -254,12 +260,13 @@ fn memory_grow(
     let (mut limiter, store) = store.resource_limiter_and_store_opaque();
     let limiter = limiter.as_mut();
     block_on!(store, async |store, _| {
+        let grow_handler = store.memory_grow_handler.clone();
         let instance = store.instance_mut(instance);
         let module = instance.env_module();
         let page_size_log2 = module.memories[module.memory_index(memory_index)].page_size_log2;
 
         let result = instance
-            .memory_grow(limiter, memory_index, delta)
+            .memory_grow(limiter, memory_index, delta, grow_handler.as_deref())
             .await?
             .map(|size_in_bytes| AllocationSize(size_in_bytes >> page_size_log2));
 
@@ -363,25 +370,30 @@ fn passive_elem_segment_drop(
 
 // Implementation of `memory.copy`.
 unsafe fn memory_copy(
-    _store: &mut dyn VMStore,
+    store: &mut dyn VMStore,
     _instance: InstanceId,
     dst: *mut u8,
     src: *mut u8,
     len: usize,
-) {
+) -> Result<()> {
+    // Bounds were checked by generated code. Permission must be obtained before
+    // entering a native copy: a denied fault cannot unwind arbitrary Rust frames.
+    store.prepare_memory_write(dst, len)?;
     let src = src.cast_const();
     // FIXME(#4203): this is known to not be sound in the presence of shared
     // memories.
     unsafe { src.copy_to(dst, len) }
+    Ok(())
 }
 
 unsafe fn memory_fill(
-    _store: &mut dyn VMStore,
+    store: &mut dyn VMStore,
     _instance: InstanceId,
     dst: *mut u8,
     val: u32,
     len: usize,
-) {
+) -> Result<()> {
+    store.prepare_memory_write(dst, len)?;
     // FIXME(#4203): this is known to not be sound in the presence of shared
     // memories.
     unsafe {
@@ -392,6 +404,7 @@ unsafe fn memory_fill(
         )]
         dst.write_bytes(val as u8, len);
     }
+    Ok(())
 }
 
 // Implementation of `ref.func`.

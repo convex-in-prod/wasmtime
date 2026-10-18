@@ -383,7 +383,7 @@ impl StoreOpaque {
         // afterwards.
         unsafe {
             heap.memory
-                .grow(delta_pages_for_alloc, limiter)
+                .grow(delta_pages_for_alloc, limiter, None)
                 .await
                 .context(GcHeapGrowthFailed)?
                 .ok_or(GcHeapGrowthFailed)?;

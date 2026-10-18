@@ -18,6 +18,8 @@ use wasmparser::WasmFeatures;
 use wasmtime_environ::{FlagValue, ObjectKind, TripleExt, Tunables};
 
 mod serialization;
+#[cfg(any(feature = "cranelift", feature = "winch"))]
+pub(crate) use serialization::ENGINE_METADATA_VERSION;
 
 /// An `Engine` which is a global context for compilation and management of wasm
 /// modules.

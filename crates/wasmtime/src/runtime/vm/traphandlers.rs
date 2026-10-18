@@ -139,9 +139,13 @@ pub(super) unsafe fn raise_preexisting_trap(store: &mut dyn VMStore) {
 /// propagate the exception to their wasm caller, but component host functions
 /// and intrinsics are a component boundary which exceptions cannot cross, so
 /// there the exception is instead turned into a trap.
+/// `call_hooks` is false for internal bulk operations that previously ran
+/// without host transitions. Their raw guest pointers must remain valid until
+/// the operation completes.
 pub fn catch_unwind_and_record_trap<R>(
     store: &mut dyn VMStore,
     uncaught_exception: UncaughtException,
+    call_hooks: bool,
     f: impl FnOnce(&mut dyn VMStore) -> R,
 ) -> R::Abi
 where
@@ -151,7 +155,7 @@ where
     // return value is always provided and if unwind information is provided
     // (e.g. `ret` is a "false"-y value) then it's recorded in TLS for the
     // unwind operation that's about to happen from Cranelift-generated code.
-    let (ret, unwind) = R::maybe_catch_unwind(store, |store| f(store));
+    let (ret, unwind) = R::maybe_catch_unwind(store, call_hooks, |store| f(store));
     if let Some(mut unwind) = unwind {
         if let UnwindReason::Trap(Ok(trap)) = &mut unwind {
             uncaught_exception.apply(&mut trap.reason);
@@ -190,6 +194,7 @@ pub trait HostResult {
     /// and initiate an unwind (currently through `raise_preexisting_trap`).
     fn maybe_catch_unwind(
         store: &mut dyn VMStore,
+        call_hooks: bool,
         f: impl FnOnce(&mut dyn VMStore) -> Self,
     ) -> (Self::Abi, Option<UnwindReason>);
 }
@@ -207,6 +212,7 @@ macro_rules! host_result_no_catch {
                 #[allow(unreachable_code, reason = "some types uninhabited on some platforms")]
                 fn maybe_catch_unwind(
                     store: &mut dyn VMStore,
+                    _call_hooks: bool,
                     f: impl FnOnce(&mut dyn VMStore) -> $t,
                 ) -> ($t, Option<UnwindReason>) {
                     (f(store), None)
@@ -234,6 +240,7 @@ impl HostResult for NonNull<u8> {
     type Abi = *mut u8;
     fn maybe_catch_unwind(
         store: &mut dyn VMStore,
+        _call_hooks: bool,
         f: impl FnOnce(&mut dyn VMStore) -> Self,
     ) -> (*mut u8, Option<UnwindReason>) {
         (f(store).as_ptr(), None)
@@ -264,8 +271,12 @@ where
 
     fn maybe_catch_unwind(
         store: &mut dyn VMStore,
+        call_hooks: bool,
         f: impl FnOnce(&mut dyn VMStore) -> Result<T, E>,
     ) -> (T::Abi, Option<UnwindReason>) {
+        #[cfg(not(feature = "call-hook"))]
+        let _ = call_hooks;
+
         // First wrap `f` in call hooks if that feature is enabled. This is used
         // as a "pretty far down in the stack" mechanism of ensuring that hooks
         // aren't forgotten.
@@ -276,23 +287,26 @@ where
         // * host functions
         // * component versions of the above
         //
-        // This specifically is NOT handling libcalls where the result can't
-        // carry a result. This should be safe as anything which doesn't return
-        // a `Result` sort of has to be simple enough to not allow recursion so
-        // it's just a brief exit from the guest to the host.
+        // Infallible libcalls do not run these hooks. Raw-pointer bulk libcalls
+        // also opt out: they must catch errors and panics without letting a
+        // general hook invalidate their already-computed pointers.
         //
         // Also note that this only happens with the `call-hook` feature because
         // this otherwise imposes a dynamic dispatch on the `store` trait object
         // which otherwise can't be optimized away.
         #[cfg(feature = "call-hook")]
         let f = move |store: &mut dyn VMStore| {
-            store.call_hook(crate::CallHook::CallingHost)?;
+            if call_hooks {
+                store.call_hook(crate::CallHook::CallingHost)?;
+            }
 
             let res = f(store);
 
             // Note that if this returns a trap then `ret` is discarded
             // entirely.
-            store.call_hook(crate::CallHook::ReturningFromHost)?;
+            if call_hooks {
+                store.call_hook(crate::CallHook::ReturningFromHost)?;
+            }
 
             res.map_err(|e| e.into())
         };
@@ -566,6 +580,10 @@ mod call_thread_state {
         pub(super) uncaught_exception: UncaughtException,
         #[cfg(all(has_native_signals))]
         pub(super) signal_handler: Option<*const SignalHandler>,
+        #[cfg(all(feature = "std", has_native_signals, unix))]
+        pub(super) signal_code_ranges: Option<crate::module::SignalCodeRanges>,
+        #[cfg(all(feature = "std", has_native_signals, unix))]
+        pub(super) pending_signal_trap: Cell<Option<(usize, wasmtime_environ::Trap)>>,
         pub(super) capture_backtrace: bool,
         #[cfg(feature = "coredump")]
         pub(super) capture_coredump: bool,
@@ -591,6 +609,8 @@ mod call_thread_state {
             // Unwind information should not be present as it should have
             // already been processed.
             debug_assert!(self.unwind.replace(None).is_none());
+            #[cfg(all(feature = "std", has_native_signals, unix))]
+            debug_assert!(self.pending_signal_trap.get().is_none());
         }
     }
 
@@ -607,6 +627,10 @@ mod call_thread_state {
                 unwinder: store.unwinder(),
                 #[cfg(all(has_native_signals))]
                 signal_handler: store.signal_handler(),
+                #[cfg(all(feature = "std", has_native_signals, unix))]
+                signal_code_ranges: store.modules().signal_code_ranges(),
+                #[cfg(all(feature = "std", has_native_signals, unix))]
+                pending_signal_trap: Cell::new(None),
                 capture_backtrace: store.engine().config().wasm_backtrace_max_frames.is_some(),
                 #[cfg(feature = "coredump")]
                 capture_coredump: store.engine().config().coredump_on_trap,
@@ -777,6 +801,18 @@ impl CallThreadState {
 
     #[cold]
     fn read_unwind(&self) -> UnwindReason {
+        #[cfg(all(feature = "std", has_native_signals, unix))]
+        if let Some((pc, trap)) = self.pending_signal_trap.take() {
+            // The signal has returned and no guest frames are live here. Only
+            // now is it safe to allocate the ordinary trap payload. Walking the
+            // discarded frames for a backtrace would no longer be safe.
+            debug_assert!(self.unwind.replace(None).is_none());
+            return UnwindReason::from(TrapReason::Jit {
+                pc,
+                faulting_addr: None,
+                trap: trap.into(),
+            });
+        }
         self.unwind.replace(None).unwrap()
     }
 
@@ -1059,34 +1095,58 @@ impl CallThreadState {
         &self,
         regs: TrapRegisters,
         faulting_addr: Option<usize>,
-        call_handler: impl FnOnce(&SignalHandler) -> bool,
+        call_handler: impl FnOnce(&SignalHandler) -> core::result::Result<bool, wasmtime_environ::Trap>,
     ) -> TrapTest {
         // First up see if any instance registered has a custom trap handler,
         // in which case run them all. If anything handles the trap then we
         // return that the trap was handled.
         let _ = &call_handler;
         #[cfg(all(has_native_signals, not(miri)))]
-        if let Some(handler) = self.signal_handler {
-            if unsafe { call_handler(&*handler) } {
-                return TrapTest::HandledByEmbedder;
+        let requested_trap = match self.signal_handler {
+            Some(handler) => match unsafe { call_handler(&*handler) } {
+                Ok(true) => return TrapTest::HandledByEmbedder,
+                Ok(false) => None,
+                Err(trap) => Some(trap),
+            },
+            None => None,
+        };
+        #[cfg(not(all(has_native_signals, not(miri))))]
+        let requested_trap: Option<wasmtime_environ::Trap> = None;
+
+        if let Some(trap) = requested_trap {
+            #[cfg(all(feature = "std", has_native_signals, unix))]
+            {
+                let Some(pointer) = &self.signal_code_ranges else {
+                    return TrapTest::NotWasm;
+                };
+                // The Store publishes immutable ranges on module registration.
+                // Only this thread can replace them; a signal interrupts that
+                // replacement and finishes before the old ranges can be freed.
+                let ranges = unsafe { &*pointer.load(core::sync::atomic::Ordering::Acquire) };
+                let index = ranges.partition_point(|range| range.end <= regs.pc);
+                if !ranges.get(index).is_some_and(|range| range.contains(&regs.pc)) {
+                    return TrapTest::NotWasm;
+                }
+                // Do not use lookup_code or set_jit_trap here: they lock the
+                // global code registry and allocate a trap/backtrace. Native
+                // faults are delegated without unwinding any Rust frames.
+                self.pending_signal_trap.set(Some((regs.pc, trap)));
+                return TrapTest::Trap(self.entry_trap_handler());
+            }
+            #[cfg(not(all(feature = "std", has_native_signals, unix)))]
+            {
+                let _ = trap;
+                unreachable!("this platform has no trapping signal callback");
             }
         }
 
-        // If this fault wasn't in wasm code, then it's not our problem
+        // Ordinary faults retain the existing trap-annotation requirement.
         let Some((code, text_offset)) = lookup_code(regs.pc) else {
             return TrapTest::NotWasm;
         };
-
-        // If the fault was at a location that was not marked as potentially
-        // trapping, then that's a bug in Cranelift/Winch/etc. Don't try to
-        // catch the trap and pretend this isn't wasm so the program likely
-        // aborts.
         let Some(trap) = code.lookup_trap_code(text_offset) else {
             return TrapTest::NotWasm;
         };
-
-        // If all that passed then this is indeed a wasm trap, so return the
-        // `Handler` setup in the original wasm frame.
         self.set_jit_trap(regs, faulting_addr, trap);
         let entry_handler = self.entry_trap_handler();
         TrapTest::Trap(entry_handler)

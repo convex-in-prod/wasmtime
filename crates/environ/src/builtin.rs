@@ -6,9 +6,9 @@ macro_rules! foreach_builtin_function {
             // Returns an index for wasm's `memory.grow` builtin function.
             memory_grow(vmctx: vmctx, delta: u64, index: u32) -> pointer;
             // Returns an index for wasm's `memory.copy`
-            memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size);
+            memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size) -> bool;
             // Returns an index for wasm's `memory.fill` instruction.
-            memory_fill(vmctx: vmctx, dst: pointer, val: u32, len: size);
+            memory_fill(vmctx: vmctx, dst: pointer, val: u32, len: size) -> bool;
             // Returns the current size of the passive `elem` segment.
             passive_elem_segment_len(vmctx: vmctx, elem: u32) -> size;
             // Returns the base address of the passive `elem` segment.

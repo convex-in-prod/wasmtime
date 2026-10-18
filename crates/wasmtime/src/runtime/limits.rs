@@ -39,8 +39,10 @@ pub trait ResourceLimiter: Send {
     ///   instance allocator, also in bytes. A value of `None`
     ///   indicates that the linear memory is unbounded.
     ///
-    /// The `current` and `desired` amounts are guaranteed to always be
-    /// multiples of the WebAssembly page size, 64KiB.
+    /// For linear memories, `current` and `desired` are multiples of the
+    /// memory's page size (normally 64KiB). The default implementation of
+    /// [`Self::gc_heap_growing`] also forwards internal GC heap allocations to
+    /// this method; those sizes follow the internal GC heap's page alignment.
     ///
     /// This function is not invoked when the requested size doesn't fit in
     /// `usize`. Additionally this function is not invoked for shared memories
@@ -73,16 +75,32 @@ pub trait ResourceLimiter: Send {
         maximum: Option<usize>,
     ) -> Result<bool>;
 
-    /// Notifies the resource limiter that growing a linear memory has failed.
+    /// Notifies the limiter that Wasmtime's internal GC heap is being allocated
+    /// or grown. This is distinct from a WebAssembly linear memory, including
+    /// a language runtime's GC heap implemented inside that linear memory.
+    /// Sizes are in bytes and follow the internal GC heap's page alignment.
     ///
-    /// This is typically called after `memory_growing` has permitted a growth
-    /// which then failed. It may also be called without a preceding call to
-    /// `memory_growing` when the requested size is invalid for the linear
-    /// memory, for example when it cannot be represented by the memory's type
-    /// (such as a 32-bit memory with a page size of 1 byte growing to 4GiB or
-    /// beyond).
+    /// The default forwards to [`Self::memory_growing`], preserving the combined
+    /// accounting of existing limiters. Override this method when linear memory
+    /// and the internal GC heap need different accounting. The return values
+    /// control this growth attempt as for [`Self::memory_growing`], with growth
+    /// failures reported through [`Self::memory_grow_failed`]. GC may collect
+    /// and retry an allocation after refused or failed growth, including an
+    /// error return. A successful retry need not report that error to the guest.
+    fn gc_heap_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool> {
+        self.memory_growing(current, desired, maximum)
+    }
+
+    /// Notifies the resource limiter that growing a linear memory or internal
+    /// GC heap has failed. This may follow a successful `memory_growing` or
+    /// `gc_heap_growing` callback, or a type-limit failure before either callback.
     ///
-    /// Note that this method is not called if `memory_growing` returns an
+    /// Note that this method is not called if either growth callback returns an
     /// error, nor if it returns `Ok(false)`.
     ///
     /// Reasons for failure include: the requested size is not valid for the
@@ -191,6 +209,17 @@ pub trait ResourceLimiterAsync: Send {
         desired: usize,
         maximum: Option<usize>,
     ) -> Result<bool>;
+
+    /// Async version of [`ResourceLimiter::gc_heap_growing`]. The default
+    /// forwards to [`Self::memory_growing`].
+    async fn gc_heap_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool> {
+        self.memory_growing(current, desired, maximum).await
+    }
 
     /// Identical to [`ResourceLimiter::memory_grow_failed`]
     fn memory_grow_failed(&mut self, error: crate::Error) -> Result<()> {

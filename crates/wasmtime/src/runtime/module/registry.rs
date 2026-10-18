@@ -3,6 +3,8 @@
 use crate::code::{EngineCode, EngineCodePC, ModuleWithCode, StoreCode, StoreCodePC};
 #[cfg(feature = "component-model")]
 use crate::component::Component;
+#[cfg(all(feature = "std", has_native_signals, unix))]
+use crate::runtime::vm::StoreBox;
 use crate::runtime::vm::VMWasmCallFunction;
 use crate::vm::CompiledModuleId;
 use crate::{Engine, FrameInfo, Module, prelude::*};
@@ -11,6 +13,8 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::ptr::NonNull;
+#[cfg(all(feature = "std", has_native_signals, unix))]
+use core::sync::atomic::{AtomicPtr, Ordering};
 use wasmtime_environ::{
     CompiledFunctionsTable, FuncKey, StaticModuleIndex, VMSharedTypeIndex,
     collections::btree_map::Entry,
@@ -75,7 +79,16 @@ pub struct ModuleRegistry {
     /// Every module is placed in this map, but not every module will
     /// be in a LoadedCode entry, because the module may have no text.
     modules: TryBTreeMap<RegisteredModuleId, Module>,
+
+    // Only enabled for an embedder that can reject signals. The pointer is
+    // published before the old immutable ranges are freed, so a signal on this
+    // Store's thread can inspect either snapshot without locks or allocations.
+    #[cfg(all(feature = "std", has_native_signals, unix))]
+    signal_code_ranges: Option<(SignalCodeRanges, StoreBox<TryVec<Range<usize>>>)>,
 }
+
+#[cfg(all(feature = "std", has_native_signals, unix))]
+pub(crate) type SignalCodeRanges = Arc<AtomicPtr<TryVec<Range<usize>>>>;
 
 struct LoadedCode {
     /// The StoreCode in this range.
@@ -149,6 +162,35 @@ impl<'a> ModuleOrComponent<'a> {
 }
 
 impl ModuleRegistry {
+    #[cfg(all(feature = "std", has_native_signals, unix))]
+    fn collect_signal_code_ranges(&self) -> Result<StoreBox<TryVec<Range<usize>>>, OutOfMemory> {
+        let mut ranges = TryVec::new();
+        for code in self.loaded_code.values() {
+            let range = code.code.text_range();
+            if range.start != range.end {
+                ranges.push(range.start.raw()..range.end.raw())?;
+            }
+        }
+        StoreBox::new(ranges)
+    }
+
+    #[cfg(all(feature = "std", has_native_signals, unix))]
+    pub(crate) fn enable_signal_traps(&mut self) -> Result<(), OutOfMemory> {
+        if self.signal_code_ranges.is_none() {
+            let ranges = self.collect_signal_code_ranges()?;
+            let pointer = try_new::<Arc<_>>(AtomicPtr::new(ranges.get().as_ptr()))?;
+            self.signal_code_ranges = Some((pointer, ranges));
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "std", has_native_signals, unix))]
+    pub(crate) fn signal_code_ranges(&self) -> Option<SignalCodeRanges> {
+        self.signal_code_ranges
+            .as_ref()
+            .map(|(pointer, _)| pointer.clone())
+    }
+
     /// Get a previously-registered module by id.
     pub fn module_by_id(&self, id: RegisteredModuleId) -> Option<&Module> {
         self.modules.get(id)
@@ -329,6 +371,17 @@ impl ModuleRegistry {
                 .modules
                 .insert(module.env_module().module_index, Some(id))?;
             breakpoint_state.update(&mut loaded_code.code, module)?;
+        }
+
+        #[cfg(all(feature = "std", has_native_signals, unix))]
+        if self.signal_code_ranges.is_some() {
+            let ranges = self.collect_signal_code_ranges()?;
+            let (pointer, previous) = self.signal_code_ranges.as_mut().unwrap();
+            // A host callback may register a module and pass its funcref back
+            // to the current activation. Publish to every activation of this
+            // Store before that new code can execute.
+            pointer.store(ranges.get().as_ptr(), Ordering::Release);
+            *previous = ranges;
         }
 
         Ok(id)

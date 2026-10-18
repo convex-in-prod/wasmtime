@@ -37,10 +37,14 @@ use object::{
 use serde_derive::{Deserialize, Serialize};
 use wasmtime_environ::{FlagValue, ObjectKind, OperatorCostStrategy, Tunables, obj};
 
-const LEGACY_VERSION: u8 = 0;
-// Older runtimes must reject artifacts that omit internal epoch checks, even
-// when the embedder disables the module version string check.
-const FUEL_EPOCH_POLLING_VERSION: u8 = 1;
+// Bulk-memory libcalls now return a trapping result. Code built with the old
+// calling convention must not ignore a denied write, nor may an older runtime
+// supply a void-returning libcall to a new trampoline. This check is independent
+// of the optional version string and also participates in compilation cache keys.
+pub(crate) const ENGINE_METADATA_VERSION: u8 = 2;
+// Keep polling artifacts distinct: replacing their interval with zero must not
+// admit code without internal epoch checks to an ordinary epoch engine.
+const FUEL_EPOCH_POLLING_VERSION: u8 = 3;
 
 /// Verifies that the serialized engine in `mmap` is compatible with the
 /// `engine` provided.
@@ -106,7 +110,7 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
     let (first, data) = data
         .split_first()
         .ok_or_else(|| format_err!("invalid engine section"))?;
-    if !matches!(*first, LEGACY_VERSION | FUEL_EPOCH_POLLING_VERSION) {
+    if !matches!(*first, ENGINE_METADATA_VERSION | FUEL_EPOCH_POLLING_VERSION) {
         bail!("mismatched version in engine section");
     }
     let (len, data) = data
@@ -154,7 +158,7 @@ pub fn append_compiler_info(engine: &Engine, obj: &mut Object<'_>, metadata: &Me
     let mut data = Vec::new();
     let interval = metadata.tunables.fuel_epoch_poll_interval;
     data.push(if interval == 0 {
-        LEGACY_VERSION
+        ENGINE_METADATA_VERSION
     } else {
         FUEL_EPOCH_POLLING_VERSION
     });

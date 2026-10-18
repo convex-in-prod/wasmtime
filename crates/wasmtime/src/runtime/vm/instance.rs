@@ -319,6 +319,7 @@ impl Instance {
     #[inline]
     pub(crate) unsafe fn enter_host_from_wasm<R>(
         vmctx: NonNull<VMContext>,
+        call_hooks: bool,
         f: impl FnOnce(&mut dyn VMStore, InstanceId) -> R,
     ) -> R::Abi
     where
@@ -337,7 +338,7 @@ impl Instance {
 
         // Thread the `store` and `instance` through panic/trap infrastructure
         // back into `f`.
-        catch_unwind_and_record_trap(store, UncaughtException::Propagate, |store| {
+        catch_unwind_and_record_trap(store, UncaughtException::Propagate, call_hooks, |store| {
             f(store, instance)
         })
     }
@@ -778,13 +779,14 @@ impl Instance {
         limiter: Option<&mut StoreResourceLimiter<'_>>,
         idx: DefinedMemoryIndex,
         delta: u64,
+        grow_handler: Option<&crate::runtime::store::MemoryGrowHandler>,
     ) -> Result<Option<usize>, Error> {
         let memory = &mut self.as_mut().memories_mut()[idx].1;
 
         // SAFETY: this is the safe wrapper around `Memory::grow` because it
         // automatically updates the `VMMemoryDefinition` in this instance after
         // a growth operation below.
-        let result = unsafe { memory.grow(delta, limiter).await };
+        let result = unsafe { memory.grow(delta, limiter, grow_handler).await };
 
         // Update the state used by a non-shared Wasm memory in case the base
         // pointer and/or the length changed.

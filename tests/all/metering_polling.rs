@@ -614,7 +614,7 @@ fn polling_artifact_identity_and_metadata_versions() {
         let (offset, len) = section.file_range().unwrap();
         let offset = usize::try_from(offset).unwrap();
         let len = usize::try_from(len).unwrap();
-        assert_eq!(artifact[offset], u8::from(interval != 0));
+        assert_eq!(artifact[offset], if interval == 0 { 2 } else { 3 });
         if interval != 0 {
             // These intervals fit in one postcard byte. A zero extension must
             // not turn an artifact without internal checks into a legacy one.

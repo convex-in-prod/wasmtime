@@ -76,7 +76,7 @@
 
 use crate::Engine;
 use crate::prelude::*;
-use crate::runtime::store::StoreResourceLimiter;
+use crate::runtime::store::{MemoryGrowHandler, StoreResourceLimiter};
 use crate::runtime::vm::vmcontext::VMMemoryDefinition;
 #[cfg(has_virtual_memory)]
 use crate::runtime::vm::{HostAlignedByteCount, MmapOffset};
@@ -246,12 +246,12 @@ impl Memory {
         limiter: Option<&mut StoreResourceLimiter<'_>>,
         kind: MemoryKind,
     ) -> Result<Self> {
-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
+        let (minimum, maximum) = Self::limit_new(ty, limiter, kind).await?;
         let tunables = engine.tunables();
         let memory_tunables = MemoryTunables::new(tunables, kind);
         let allocation = creator.new_memory(ty, &memory_tunables, minimum, maximum)?;
 
-        let memory = LocalMemory::new(ty, &memory_tunables, allocation, memory_image)?;
+        let memory = LocalMemory::new(ty, &memory_tunables, allocation, memory_image, kind)?;
         Ok(if ty.shared {
             Memory::Shared(SharedMemory::wrap(engine, ty, memory)?)
         } else {
@@ -268,8 +268,9 @@ impl Memory {
         base_capacity: usize,
         memory_image: MemoryImageSlot,
         limiter: Option<&mut StoreResourceLimiter<'_>>,
+        kind: MemoryKind,
     ) -> Result<Self> {
-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
+        let (minimum, maximum) = Self::limit_new(ty, limiter, kind).await?;
         let pooled_memory = StaticMemory::new(base, base_capacity, minimum, maximum)?;
         let allocation = try_new::<Box<_>>(pooled_memory)?;
 
@@ -277,7 +278,7 @@ impl Memory {
         // `LocalMemory` structure created, notably we already have
         // `memory_image` and regardless of configuration settings this memory
         // can't move its base pointer since it's a fixed allocation.
-        let mut memory = LocalMemory::new(ty, memory_tunables, allocation, None)?;
+        let mut memory = LocalMemory::new(ty, memory_tunables, allocation, None, kind)?;
         assert!(memory.memory_image.is_none());
         memory.memory_image = Some(memory_image);
         memory.memory_may_move = false;
@@ -299,6 +300,7 @@ impl Memory {
     pub(crate) async fn limit_new(
         ty: &wasmtime_environ::Memory,
         limiter: Option<&mut StoreResourceLimiter<'_>>,
+        kind: MemoryKind,
     ) -> Result<(usize, Option<usize>)> {
         let page_size = usize::try_from(ty.page_size()).unwrap();
 
@@ -343,7 +345,7 @@ impl Memory {
         // now the expected uses of limiter means that's ok.
         if let Some(limiter) = limiter {
             if !limiter
-                .memory_growing(0, minimum.unwrap_or(absolute_max), maximum)
+                .memory_growing(0, minimum.unwrap_or(absolute_max), maximum, kind)
                 .await?
             {
                 bail!(
@@ -416,9 +418,10 @@ impl Memory {
         &mut self,
         delta_pages: u64,
         limiter: Option<&mut StoreResourceLimiter<'_>>,
+        grow_handler: Option<&MemoryGrowHandler>,
     ) -> Result<Option<usize>, Error> {
         let result = match self {
-            Memory::Local(mem) => mem.grow(delta_pages, limiter).await?,
+            Memory::Local(mem) => mem.grow(delta_pages, limiter, grow_handler).await?,
             Memory::Shared(mem) => mem.grow(delta_pages)?,
         };
         match result {
@@ -536,6 +539,7 @@ impl Memory {
 pub struct LocalMemory {
     alloc: Box<dyn RuntimeLinearMemory>,
     ty: wasmtime_environ::Memory,
+    kind: MemoryKind,
     memory_may_move: bool,
     memory_guard_size: usize,
     memory_reservation: usize,
@@ -551,6 +555,7 @@ impl LocalMemory {
         memory_tunables: &MemoryTunables<'_>,
         alloc: Box<dyn RuntimeLinearMemory>,
         memory_image: Option<&Arc<MemoryImage>>,
+        kind: MemoryKind,
     ) -> Result<LocalMemory> {
         // If a memory image was specified, try to create the MemoryImageSlot on
         // top of our mmap.
@@ -586,6 +591,7 @@ impl LocalMemory {
         };
         Ok(LocalMemory {
             ty: *ty,
+            kind,
             alloc,
             memory_may_move: ty.memory_may_move(memory_tunables),
             memory_image,
@@ -608,6 +614,7 @@ impl LocalMemory {
         &mut self,
         delta_pages: u64,
         mut limiter: Option<&mut StoreResourceLimiter<'_>>,
+        grow_handler: Option<&MemoryGrowHandler>,
     ) -> Result<Option<(usize, usize)>, Error> {
         let old_byte_size = self.alloc.byte_size();
 
@@ -651,7 +658,7 @@ impl LocalMemory {
         // Store limiter gets first chance to reject memory_growing.
         if let Some(limiter) = &mut limiter {
             if !limiter
-                .memory_growing(old_byte_size, new_byte_size, maximum)
+                .memory_growing(old_byte_size, new_byte_size, maximum, self.kind)
                 .await?
             {
                 return Ok(None);
@@ -663,46 +670,46 @@ impl LocalMemory {
         let base_ptr_before = self.alloc.base().as_mut_ptr();
         let required_to_not_move_memory = new_byte_size <= self.alloc.byte_capacity();
 
-        let result = (|| -> Result<()> {
-            // Never exceed maximum, even if limiter permitted it.
-            if let Some(max) = maximum {
-                if new_byte_size > max {
-                    bail!("Memory maximum size exceeded");
-                }
-            }
-
-            // If memory isn't allowed to move then don't let growth happen
-            // beyond the initial capacity
-            if !self.memory_may_move && new_byte_size > self.alloc.byte_capacity() {
-                bail!("Memory maximum size exceeded");
+        // Preserve type and reservation limits even if the Store limiter
+        // accepted growth. The private-exposure hook runs only after these.
+        let result = if maximum.is_some_and(|max| new_byte_size > max)
+            || (!self.memory_may_move && new_byte_size > self.alloc.byte_capacity())
+        {
+            Err(crate::format_err!("Memory maximum size exceeded"))
+        } else {
+            // Unlike the generic resource limiter, this hook identifies the
+            // linear allocation. Reserve private-page exposure before either
+            // the image overlay or the allocator makes the tail writable.
+            if grow_handler.is_some_and(|handler| {
+                !handler(base_ptr_before as usize, old_byte_size, new_byte_size)
+            }) {
+                return Err(wasmtime_environ::Trap::AllocationTooLarge.into());
             }
 
             // If we have a CoW image overlay then let it manage accessible
             // bytes. Once the heap limit is modified inform the underlying
             // allocation that the size has changed.
             //
-            // If the growth is going beyond the size of the heap image then
-            // discard it. This should only happen for `MmapMemory` where
-            // `no_clear_on_drop` is set so the destructor doesn't do anything.
-            // For now be maximally sure about this by asserting that memory can
-            // indeed move and that we're on unix. If this wants to run
-            // somewhere else like Windows or with other allocations this may
-            // need adjusting.
-            if let Some(image) = &mut self.memory_image {
-                if new_byte_size <= self.alloc.byte_capacity() {
-                    image.set_heap_limit(new_byte_size)?;
-                    self.alloc.set_byte_size(new_byte_size);
-                    return Ok(());
+            // Growth beyond the reserved allocation discards image bookkeeping
+            // before relocating. Dropping an on-demand image slot does not
+            // reset its mapping, so the allocator can still copy the old bytes.
+            (|| -> Result<()> {
+                if let Some(image) = &mut self.memory_image {
+                    if new_byte_size <= self.alloc.byte_capacity() {
+                        image.set_heap_limit(new_byte_size)?;
+                        self.alloc.set_byte_size(new_byte_size);
+                        return Ok(());
+                    }
+                    assert!(cfg!(unix));
+                    assert!(self.memory_may_move);
+                    self.memory_image = None;
                 }
-                assert!(cfg!(unix));
-                assert!(self.memory_may_move);
-                self.memory_image = None;
-            }
 
-            // And failing all that fall back to the underlying allocation to
-            // grow it.
-            self.alloc.grow_to(new_byte_size)
-        })();
+                // And failing all that fall back to the underlying allocation to
+                // grow it.
+                self.alloc.grow_to(new_byte_size)
+            })()
+        };
 
         match result {
             Ok(()) => {

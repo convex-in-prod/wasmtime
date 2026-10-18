@@ -31,10 +31,12 @@ use wasmtime_environ::{
 /// trap, or otherwise it's whatever the host created the error with when
 /// returning an error for a host call.
 ///
-/// Any error which happens while WebAssembly is executing will also, by
-/// default, capture a backtrace of the wasm frames while executing. This
-/// backtrace is represented with a [`WasmBacktrace`] instance and is attached
-/// to the [`wasmtime::Error`] return value as a
+/// Errors which happen while WebAssembly is executing will also, by default,
+/// capture a backtrace of the wasm frames while executing. Traps requested by
+/// an embedder's custom signal handler omit backtraces and coredumps so that
+/// rejection can remain allocation-free and lock-free in signal context. A
+/// captured backtrace is represented with a [`WasmBacktrace`] instance and is
+/// attached to the [`wasmtime::Error`] return value as a
 /// [`context`](crate::Error::context). Inspecting a [`WasmBacktrace`] can be
 /// done with the [`downcast_ref`](crate::Error::downcast_ref) function. For
 /// information on this see the [`WasmBacktrace`] documentation.

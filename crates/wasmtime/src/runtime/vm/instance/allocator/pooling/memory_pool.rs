@@ -357,8 +357,12 @@ impl MemoryPool {
         request: &mut InstanceAllocationRequest<'_, '_>,
         ty: &wasmtime_environ::Memory,
         memory_index: Option<DefinedMemoryIndex>,
+        memory_kind: MemoryKind,
     ) -> Result<(MemoryAllocationIndex, Memory)> {
         let tunables = request.store.engine().tunables();
+        // Both allocation kinds use this pool's linear-memory layout. Preserve
+        // the actual kind separately for limiter callbacks, without changing
+        // the reservation or guard assumptions of the preallocated slots.
         let memory_tunables = MemoryTunables::new(tunables, MemoryKind::LinearMemory);
         let stripe_index = if let Some(pkey) = request.store.get_pkey() {
             pkey.as_stripe()
@@ -436,6 +440,7 @@ impl MemoryPool {
             base_capacity.byte_count(),
             slot,
             request.limiter.as_deref_mut(),
+            memory_kind,
         )
         .await?;
         guard.active = false;

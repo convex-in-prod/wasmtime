@@ -9,8 +9,15 @@ use std::ptr::{self, null_mut};
 use wasmtime_unwinder::Handler;
 
 /// Function which may handle custom signals while processing traps.
-pub type SignalHandler =
-    Box<dyn Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool + Send + Sync>;
+pub type SignalHandler = Box<
+    dyn Fn(
+            libc::c_int,
+            *const libc::siginfo_t,
+            *const libc::c_void,
+        ) -> core::result::Result<bool, crate::Trap>
+        + Send
+        + Sync,
+>;
 
 const UNINIT_SIGACTION: libc::sigaction = unsafe { mem::zeroed() };
 static mut PREV_SIGSEGV: libc::sigaction = UNINIT_SIGACTION;

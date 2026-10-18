@@ -1775,7 +1775,9 @@ where
             &mut self.context,
             Callee::Builtin(builtin),
         )?;
-        Ok(())
+        // The trampoline consumes a false result as a trap; its successful
+        // result is not a value produced by the WebAssembly instruction.
+        self.context.pop_and_free(self.masm)
     }
 
     /// Emit the `memory.fill` operation.
@@ -1820,7 +1822,9 @@ where
             &mut self.context,
             Callee::Builtin(builtin),
         )?;
-        Ok(())
+        // The trampoline consumes a false result as a trap; its successful
+        // result is not a value produced by the WebAssembly instruction.
+        self.context.pop_and_free(self.masm)
     }
 
     /// Emit the `memory.init` operation.
@@ -1926,7 +1930,9 @@ where
             &mut self.context,
             Callee::Builtin(builtin),
         )?;
-        Ok(())
+        // The trampoline consumes a false result as a trap; its successful
+        // result is not a value produced by the WebAssembly instruction.
+        self.context.pop_and_free(self.masm)
     }
 
     pub fn emit_data_drop(&mut self, data_index: DataIndex) -> Result<()> {

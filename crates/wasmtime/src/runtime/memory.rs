@@ -14,21 +14,32 @@ use wasmtime_environ::DefinedMemoryIndex;
 
 pub use crate::runtime::vm::WaitResult;
 
-/// Error for out of bounds [`Memory`] access.
+/// Error for out of bounds [`Memory`] access or a denied host write.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct MemoryAccessError {
     // Keep struct internals private for future extensibility.
-    _private: (),
+    write_denied: bool,
 }
 
 impl fmt::Display for MemoryAccessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "out of bounds memory access")
+        f.write_str(if self.write_denied {
+            "memory write rejected by the Store's write handler"
+        } else {
+            "out of bounds memory access"
+        })
     }
 }
 
 impl core::error::Error for MemoryAccessError {}
+
+impl MemoryAccessError {
+    /// Whether the access was in bounds but denied by the Store's write handler.
+    pub fn is_write_denied(&self) -> bool {
+        self.write_denied
+    }
+}
 
 /// A WebAssembly linear memory.
 ///
@@ -51,13 +62,16 @@ impl core::error::Error for MemoryAccessError {}
 /// * [`Memory::write`]
 /// * [`Memory::data`]
 /// * [`Memory::data_mut`]
+/// * [`Memory::data_mut_range`]
+/// * [`Memory::data_and_store_mut`]
 ///
 /// Note that all of these consider the entire store context as borrowed for the
 /// duration of the call or the duration of the returned slice. This largely
 /// means that while the function is running you'll be unable to borrow anything
-/// else from the store. This includes getting access to the `T` on
-/// [`Store<T>`](crate::Store), but it also means that you can't recursively
-/// call into WebAssembly for instance.
+/// else from the store or recursively call into WebAssembly. The
+/// [`Memory::data_and_store_mut`] method allows access to the `T` on
+/// [`Store<T>`](crate::Store) alongside the memory slice because those borrows
+/// are disjoint.
 ///
 /// If you'd like to dip your toes into handling [`Memory`] in a more raw
 /// fashion (e.g. by using raw pointers or raw slices), then there's a few
@@ -344,9 +358,7 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
-    /// memory allocation fails. See the `OutOfMemory` type's documentation for
-    /// details on Wasmtime's out-of-memory handling.
+    /// Returns [`MemoryAccessError`] if the range is out of bounds.
     ///
     /// # Panics
     ///
@@ -362,7 +374,9 @@ impl Memory {
             .data(&store)
             .get(offset..)
             .and_then(|s| s.get(..buffer.len()))
-            .ok_or(MemoryAccessError { _private: () })?;
+            .ok_or(MemoryAccessError {
+                write_denied: false,
+            })?;
         buffer.copy_from_slice(slice);
         Ok(())
     }
@@ -375,9 +389,10 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
-    /// memory allocation fails. See the `OutOfMemory` type's documentation for
-    /// details on Wasmtime's out-of-memory handling.
+    /// Returns [`MemoryAccessError`] for an out-of-bounds access or when the
+    /// Store's write handler rejects the destination range. A rejected write
+    /// leaves the contents unchanged; [`MemoryAccessError::is_write_denied`]
+    /// distinguishes the two cases.
     ///
     /// # Panics
     ///
@@ -388,13 +403,53 @@ impl Memory {
         offset: usize,
         buffer: &[u8],
     ) -> Result<(), MemoryAccessError> {
-        let mut context = store.as_context_mut();
-        self.data_mut(&mut context)
-            .get_mut(offset..)
-            .and_then(|s| s.get_mut(..buffer.len()))
-            .ok_or(MemoryAccessError { _private: () })?
+        let store = store.as_context_mut();
+        // Preserve the ownership check even when the requested range overflows.
+        self.instance.assert_belongs_to(store.0.id());
+        let end = offset.checked_add(buffer.len()).ok_or(MemoryAccessError {
+            write_denied: false,
+        })?;
+        self.data_mut_range(store, offset..end)?
             .copy_from_slice(buffer);
         Ok(())
+    }
+
+    /// Returns a writable subrange, checking the Store's optional write handler
+    /// before granting access. A rejected range returns an error without changing
+    /// memory contents. The permission covers the entire lifetime of the returned
+    /// slice. This avoids granting write access to the whole memory when an
+    /// embedder accounts for private copies of protected pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the range is reversed, out of bounds, or denied by the
+    /// write handler. Bounds are checked before calling the handler, and empty
+    /// in-bounds ranges do not call it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this memory doesn't belong to `store`.
+    pub fn data_mut_range<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+        range: core::ops::Range<usize>,
+    ) -> Result<&'a mut [u8], MemoryAccessError> {
+        let store = store.into();
+        let definition = store[self.instance].memory(self.index);
+        debug_assert!(!self.ty(&store).is_shared());
+        let length = range
+            .end
+            .checked_sub(range.start)
+            .filter(|_| range.end <= definition.current_length())
+            .ok_or(MemoryAccessError {
+                write_denied: false,
+            })?;
+        let pointer = unsafe { definition.base.as_ptr().add(range.start) };
+        store
+            .0
+            .prepare_memory_write(pointer, length)
+            .map_err(|_| MemoryAccessError { write_denied: true })?;
+        Ok(unsafe { slice::from_raw_parts_mut(pointer, length) })
     }
 
     /// Returns this memory as a native Rust slice.
@@ -421,17 +476,17 @@ impl Memory {
     ///
     /// # Panics
     ///
-    /// Panics if this memory doesn't belong to `store`.
+    /// Panics if this memory doesn't belong to `store`, or if its write handler
+    /// rejects write access to the entire memory. Use [`Memory::data_mut_range`]
+    /// to request a smaller range and receive a recoverable error.
     pub fn data_mut<'a, T: 'static>(
         &self,
         store: impl Into<StoreContextMut<'a, T>>,
     ) -> &'a mut [u8] {
-        unsafe {
-            let store = store.into();
-            let definition = store[self.instance].memory(self.index);
-            debug_assert!(!self.ty(store).is_shared());
-            slice::from_raw_parts_mut(definition.base.as_ptr(), definition.current_length())
-        }
+        let store = store.into();
+        let length = self.data_size(&store);
+        self.data_mut_range(store, 0..length)
+            .expect("whole-memory write access denied; use Memory::data_mut_range")
     }
 
     /// Same as [`Memory::data_mut`], but also returns the `T` from the
@@ -445,7 +500,8 @@ impl Memory {
     ///
     /// # Panics
     ///
-    /// Panics if this memory doesn't belong to `store`.
+    /// Panics if this memory doesn't belong to `store`, or if its write handler
+    /// rejects write access to the entire memory, as with [`Memory::data_mut`].
     pub fn data_and_store_mut<'a, T: 'static>(
         &self,
         store: impl Into<StoreContextMut<'a, T>>,
@@ -469,6 +525,11 @@ impl Memory {
 
     /// Returns the base pointer, in the host's address space, that the memory
     /// is located at.
+    ///
+    /// This does not invoke the Store's write handler. Before writing through
+    /// this pointer to protected memory, the caller must obtain permission from
+    /// its memory controller and keep the range writable until the write ends.
+    /// Prefer [`Memory::data_mut_range`] for checked, recoverable access.
     ///
     /// For more information and examples see the documentation on the
     /// [`Memory`] type.
@@ -666,10 +727,11 @@ impl Memory {
         limiter: Option<&mut StoreResourceLimiter<'_>>,
         delta: u64,
     ) -> Result<u64> {
+        let grow_handler = store.memory_grow_handler.clone();
         let result = self
             .instance
             .get_mut(store)
-            .memory_grow(limiter, self.index, delta)
+            .memory_grow(limiter, self.index, delta, grow_handler.as_deref())
             .await?;
         match result {
             Some(size) => {

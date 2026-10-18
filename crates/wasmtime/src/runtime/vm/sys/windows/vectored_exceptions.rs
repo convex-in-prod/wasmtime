@@ -235,7 +235,7 @@ unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINT
         } else {
             None
         };
-        match info.test_if_trap(regs, faulting_addr, |handler| handler(exception_info)) {
+        match info.test_if_trap(regs, faulting_addr, |handler| Ok(handler(exception_info))) {
             TrapTest::NotWasm => EXCEPTION_CONTINUE_SEARCH,
             TrapTest::HandledByEmbedder => EXCEPTION_CONTINUE_EXECUTION,
             TrapTest::Trap(handler) => {

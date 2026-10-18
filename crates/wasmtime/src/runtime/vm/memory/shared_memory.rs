@@ -39,14 +39,24 @@ impl SharedMemory {
         );
         // Note that without a limiter being passed to `limit_new` this
         // `assert_ready` should never panic.
-        let (minimum_bytes, maximum_bytes) = vm::assert_ready(Memory::limit_new(ty, None))?;
+        let (minimum_bytes, maximum_bytes) = vm::assert_ready(Memory::limit_new(
+            ty,
+            None,
+            wasmtime_environ::MemoryKind::LinearMemory,
+        ))?;
         let mmap_memory = MmapMemory::new(ty, &memory_tunables, minimum_bytes, maximum_bytes)?;
         let boxed: Box<dyn crate::runtime::vm::RuntimeLinearMemory> =
             try_new::<Box<_>>(mmap_memory)?;
         Self::wrap(
             engine,
             ty,
-            LocalMemory::new(ty, &memory_tunables, boxed, None)?,
+            LocalMemory::new(
+                ty,
+                &memory_tunables,
+                boxed,
+                None,
+                wasmtime_environ::MemoryKind::LinearMemory,
+            )?,
         )
     }
 
@@ -92,7 +102,7 @@ impl SharedMemory {
         let mut memory = self.0.memory.write().unwrap();
         // Without a limiter being passed in this shouldn't have an await point,
         // so it should be safe to assert that it's ready.
-        let result = vm::assert_ready(memory.grow(delta_pages, None))?;
+        let result = vm::assert_ready(memory.grow(delta_pages, None, None))?;
         if let Some((_old_size_in_bytes, new_size_in_bytes)) = result {
             // Store the new size to the `VMMemoryDefinition` for JIT-generated
             // code (and runtime functions) to access. No other code can be
