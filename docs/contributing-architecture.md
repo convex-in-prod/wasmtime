@@ -441,25 +441,39 @@ debugging.
 
 ## Tables and `externref`
 
-WebAssembly tables contain reference types, currently either `funcref` or
-`externref`. A `funcref` in Wasmtime is represented as `*mut
-VMCallerCheckedFuncRef` and an `externref` is represented as `VMExternRef`
-(which is internally `*mut VMExternData`). Tables are consequently represented
-as vectors of pointers.  Table storage memory management by default goes through
-Rust's `Vec` which uses `malloc` and friends for memory. With the pooling
-allocator this uses preallocated memory for storage.
+WebAssembly tables contain references. A function reference in Wasmtime is a
+pointer to a `VMFuncRef`. Function table storage is dynamically allocated by
+default; the pooling allocator instead supplies preallocated storage.
+
+With lazy table initialization enabled, zero table entries mean uninitialized.
+Explicit writes, including null writes, set an initialized tag bit. Reads mask
+off that bit, or initialize a zero entry before returning its value. Defined
+tables can use precomputed function-index images. Active function-index segments
+targeting imported tables can instead record their source instance and range in
+a bounded history on the table. The immutable function-index lists belong to
+shared module metadata. Bounds checks, offset evaluation, segment order and fuel
+charges still occur during startup; only `VMFuncRef` materialization is deferred.
+General expressions and segments beyond the history limit use eager writes.
+
+A later deferred segment clears its range to the uninitialized marker after
+recording its binding. The most recent binding covering an uninitialized slot
+supplies the function. Explicit writes override these bindings until another
+segment replaces the slot. Once read, an entry is tagged and needs no further
+history lookup.
+Copies read and initialize each source before writing its destination, in the
+direction required for overlapping ranges.
 
 As mentioned previously `Store` has no form of internal garbage
 collection for wasm objects themselves so a `funcref` table in wasm is pretty
-simple in that there's no lifetime management of any of the pointers stored
-within, they're simply assumed to be valid for as long as the table is in use.
+simple in that there's no lifetime management of individual pointers stored
+within it. The Store retains source instances before startup, including when a
+later segment or start function traps. Table destruction does not dereference
+these sources. Pooling drops the table's history when returning its storage and
+constructs an empty history on reuse.
 
-For tables of `externref` the story is more complicated. The `VMExternRef` is a
-version of `Arc<dyn Any>` but specialized in Wasmtime so JIT code knows where
-the offset of the reference count field to directly manipulate it is.
-Furthermore tables of `externref` values need to manage the reference count
-field themselves, since the pointer stored in the table is required to have a
-strong reference count allocated to it.
+Tables of GC references, including `externref`, store `VMGcRef` values and use
+the configured collector's read and write barriers. They do not use the function
+table tags or deferred function segments.
 
 ## GC and `externref`
 

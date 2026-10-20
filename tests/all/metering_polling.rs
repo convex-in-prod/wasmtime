@@ -614,7 +614,23 @@ fn polling_artifact_identity_and_metadata_versions() {
         let (offset, len) = section.file_range().unwrap();
         let offset = usize::try_from(offset).unwrap();
         let len = usize::try_from(len).unwrap();
-        assert_eq!(artifact[offset], if interval == 0 { 2 } else { 3 });
+        assert_eq!(artifact[offset], if interval == 0 { 6 } else { 7 });
+        let mut config = polling_config(interval);
+        config
+            .module_version(wasmtime::ModuleVersionStrategy::None)
+            .unwrap();
+        let consumer = Engine::new(&config).unwrap();
+        for old_version in [0, 1, 2, 3, 4, 5] {
+            let mut old = artifact.clone();
+            old[offset] = old_version;
+            let error = unsafe { Module::deserialize(&consumer, &old) }.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("mismatched version in engine section"),
+                "{error:#}"
+            );
+        }
         if interval != 0 {
             // These intervals fit in one postcard byte. A zero extension must
             // not turn an artifact without internal checks into a legacy one.

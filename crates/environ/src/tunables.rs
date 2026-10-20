@@ -28,12 +28,6 @@ macro_rules! define_tunables {
             )*
         }
 
-        impl core::hash::Hash for $tunables {
-            fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-                $(define_tunables!(@hash $field, self.$field, state);)*
-            }
-        }
-
         /// Optional tunable configuration options used in `wasmtime::Config`
         #[derive(Default, Clone)]
         #[expect(missing_docs, reason = "macro-generated fields")]
@@ -61,21 +55,11 @@ macro_rules! define_tunables {
             }
         }
     };
-    (@hash fuel_epoch_poll_interval, $value:expr, $state:ident) => {
-        // Keep legacy engine/cache identities when this extension is disabled.
-        if $value != 0 {
-            core::hash::Hash::hash("fuel_epoch_poll_interval", $state);
-            core::hash::Hash::hash(&$value, $state);
-        }
-    };
-    (@hash $field:ident, $value:expr, $state:ident) => {
-        core::hash::Hash::hash(&$value, $state);
-    };
 }
 
 define_tunables! {
     /// Tunable parameters for WebAssembly compilation.
-    #[derive(Clone, Serialize, Deserialize, Debug)]
+    #[derive(Clone, Hash, Serialize, Deserialize, Debug)]
     pub struct Tunables {
         /// The garbage collector implementation to use, which implies the layout of
         /// GC objects and barriers that must be emitted in Wasm code.
@@ -116,8 +100,8 @@ define_tunables! {
         pub epoch_interruption: bool,
 
         /// Fuel-slice interval for internal epoch polling; zero keeps inline checks.
-        /// Serialized separately in versioned engine metadata to preserve the
-        /// legacy representation when this mode is disabled.
+        /// Serialized separately in versioned engine metadata so polling
+        /// artifacts can require an explicit nonzero interval.
         #[serde(skip)]
         pub fuel_epoch_poll_interval: u64,
 

@@ -148,11 +148,15 @@ pub mod raw {
             )*
         };
 
-        // These operations already carry bounds-checked raw pointers. General
-        // call hooks may grow memory or move GC objects before those pointers
-        // are used. The write handler has an explicit no-reentry contract.
+        // These operations carry bounds-checked raw pointers and previously
+        // ran without call hooks. Keep that behavior with fallible write
+        // admission; the write handler must not reenter or relocate memory.
         (@call_hooks memory_copy) => (false);
         (@call_hooks memory_fill) => (false);
+        // Eager active function segments use infallible ref_func calls, which
+        // do not invoke hooks. Deferring them must not introduce hook calls or
+        // traps between segment application and its fuel charge.
+        (@call_hooks table_init_func_segment) => (false);
         (@call_hooks $name:ident) => (true);
 
         (@ty u32) => (u32);
@@ -414,6 +418,22 @@ fn ref_func(store: &mut dyn VMStore, instance: InstanceId, func_index: u32) -> N
         .get_func_ref(registry, FuncIndex::from_u32(func_index))
         .expect("ref_func: funcref should always be available for given func index")
         .cast()
+}
+
+fn table_init_func_segment(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    table_index: u32,
+    segment: u32,
+    offset: u64,
+) -> Result<()> {
+    let (instance, registry) = store.instance_and_module_registry_mut(instance);
+    instance.initialize_deferred_func_segment(
+        registry,
+        TableIndex::from_u32(table_index),
+        segment,
+        offset,
+    )
 }
 
 // Returns a table entry after lazily initializing it.

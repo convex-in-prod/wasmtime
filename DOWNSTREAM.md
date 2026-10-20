@@ -14,13 +14,15 @@ implementation without maintaining separate source copies.
   returns, and rooted exception continuations retain checks. Deadline callbacks,
   asynchronous yields, interruptions, and exact fuel accounting remain active.
 
-The interval is an engine setting inherited by every store. Zero preserves the
-ordinary instrumentation, version-zero engine metadata bytes, and engine hash
-input. Nonzero intervals use version-one metadata with an explicit interval;
-an older runtime rejects that format even with module version-string validation
-disabled. A consumer must use the same interval as its producer. Source-keyed
-build caches must still invalidate changed compilation code; artifact
-compatibility does not establish that an older artifact includes a newer fix.
+The interval is an engine setting inherited by every store. Zero preserves
+ordinary instrumentation. Native artifacts use metadata version six, or seven
+with an explicit nonzero polling interval. These versions include the upstream
+tunables and builtin layout and the downstream deferred table-initialization
+contract. Older native artifacts are rejected before module decoding even when
+module version-string validation is disabled. Producer and consumer must agree
+on the interval and native ABI; portable Wasm modules do not require a specific
+Wasmtime revision. Source-keyed build caches still invalidate changed compiler
+code even when native compatibility happens to be unchanged.
 
 Polling supports core modules with default operator costs, fuel consumption, and
 epoch interruption. Components have separate host-call trampolines and are not
@@ -33,8 +35,7 @@ line block may overshoot the active slice before its next checkpoint.
 `tests/all/metering_polling.rs` covers metering values and accounting, exceptions,
 entry and continuation boundaries, interruption and yield behavior, reference
 rooting through collection, configuration rejection, and artifact identities.
-Run it with both null and copying collector configurations. Cross-version
-acceptance also requires executing legacy artifacts in the new zero-interval
-runtime, executing new zero-interval artifacts in the legacy runtime, comparing
-their engine metadata and hash inputs, and checking rejection of polling
-artifacts by the legacy runtime.
+Run it with both null and copying collector configurations. Native compatibility
+checks reject obsolete metadata versions, mismatched intervals, and tampered
+polling metadata before deserialization. Portable modules remain usable by other
+compatible WebAssembly runtimes without these native extensions.

@@ -117,9 +117,11 @@ of criteria. It's done on an as-needed basis. Requirements, however, are:
 * Wasm-level ABI-breaking changes are by default not allowed in patch releases.
   Users are expected to, for example, be able to load `*.cwasm` artifacts from
   before the patch release is made. If an ABI-breaking change is necessary then
-  be sure to update `crates/wasmtime/src/engine/serialization.rs` and the
-  `WasmtimeVersion` matching strategy to modify the string to ensure older
-  artifacts cannot be loaded.
+  bump the mandatory engine metadata versions in
+  `crates/wasmtime/src/engine/serialization.rs` so older artifacts cannot be
+  loaded even when module-version string checking is disabled. Keep all
+  supported metadata variants distinct, and ensure compilation cache and
+  precompile compatibility keys include the changed version.
 
 Making a patch release is somewhat more manual than a major version, but like
 before there's automation to help guide the process as well and take care of

@@ -37,14 +37,14 @@ use object::{
 use serde_derive::{Deserialize, Serialize};
 use wasmtime_environ::{FlagValue, ObjectKind, OperatorCostStrategy, Tunables, obj};
 
-// Bulk-memory libcalls now return a trapping result. Code built with the old
-// calling convention must not ignore a denied write, nor may an older runtime
-// supply a void-returning libcall to a new trampoline. This check is independent
-// of the optional version string and also participates in compilation cache keys.
-pub(crate) const ENGINE_METADATA_VERSION: u8 = 2;
-// Keep polling artifacts distinct: replacing their interval with zero must not
-// admit code without internal epoch checks to an ordinary epoch engine.
-const FUEL_EPOCH_POLLING_VERSION: u8 = 3;
+// Versions 6/7 include the refreshed upstream tunables and builtin layout.
+// Versions 4/5 already carried deferred imported-table metadata, but are not
+// ABI-compatible with this layout. Reject them before decoding native module
+// data even when the embedder disables the optional source version string.
+pub(crate) const ENGINE_METADATA_VERSION: u8 = 6;
+// Polling artifacts remain distinct so removing an interval cannot admit code
+// without internal epoch checks to an ordinary epoch engine.
+const FUEL_EPOCH_POLLING_VERSION: u8 = 7;
 
 /// Verifies that the serialized engine in `mmap` is compatible with the
 /// `engine` provided.

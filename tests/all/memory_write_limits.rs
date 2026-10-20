@@ -202,7 +202,10 @@ pub(crate) fn check_growth(strategy: wasmtime::Strategy) -> wasmtime::Result<()>
     }
     assert_eq!(allowed.grow(&mut store, 1)?, 2);
     assert_eq!(
-        denied.grow(&mut store, 1).unwrap_err().downcast_ref::<Trap>(),
+        denied
+            .grow(&mut store, 1)
+            .unwrap_err()
+            .downcast_ref::<Trap>(),
         Some(&Trap::AllocationTooLarge)
     );
     Ok(())
@@ -245,13 +248,13 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
         .file_range()
         .unwrap()
         .0 as usize;
-    assert_eq!(serialized[offset], 2);
-    for old_version in [0, 1] {
+    assert_eq!(serialized[offset], 6);
+    for old_version in [0, 1, 2, 3, 4, 5] {
         let mut old = serialized.clone();
         old[offset] = old_version;
         let error = unsafe { Module::deserialize(&engine, old) }
             .err()
-            .expect("old builtin ABI must be rejected");
+            .expect("old native metadata and builtin ABI must be rejected");
         assert!(
             error
                 .to_string()
@@ -285,7 +288,10 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
                 .unwrap()
                 .typed::<(), ()>(&caller)?;
             let error = put.call(&mut caller, ()).unwrap_err();
-            assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::AllocationTooLarge));
+            assert_eq!(
+                error.downcast_ref::<Trap>(),
+                Some(&Trap::AllocationTooLarge)
+            );
             // Catching the inner trap must let the outer Wasm activation resume.
             Ok(())
         },
@@ -363,7 +369,10 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
         .get_typed_func::<(), ()>(&mut store, "fixed_store")?
         .call(&mut store, ())
         .unwrap_err();
-    assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::AllocationTooLarge));
+    assert_eq!(
+        error.downcast_ref::<Trap>(),
+        Some(&Trap::AllocationTooLarge)
+    );
     instance
         .get_typed_func::<(), ()>(&mut store, "nested")?
         .call(&mut store, ())?;
@@ -374,7 +383,10 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
         .get_typed_func::<(), ()>(&mut store, "register_then_store")?
         .call(&mut store, ())
         .unwrap_err();
-    assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::AllocationTooLarge));
+    assert_eq!(
+        error.downcast_ref::<Trap>(),
+        Some(&Trap::AllocationTooLarge)
+    );
     assert_eq!(
         instance
             .get_typed_func::<(), i32>(&mut store, "healthy")?
@@ -442,14 +454,19 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
             .unwrap_err()
             .is_write_denied()
     );
-    assert!(memory.data_mut_range(&mut store, length..length)?.is_empty());
-    assert!(!memory
-        .data_mut_range(&mut store, 5..4)
-        .unwrap_err()
-        .is_write_denied());
+    assert!(
+        memory
+            .data_mut_range(&mut store, length..length)?
+            .is_empty()
+    );
+    assert!(
+        !memory
+            .data_mut_range(&mut store, 5..4)
+            .unwrap_err()
+            .is_write_denied()
+    );
     for (name, source_end) in [("fill", 0), ("copy", length), ("init", 8)] {
-        let operation = instance
-            .get_typed_func::<(i32, i32, i32), ()>(&mut store, name)?;
+        let operation = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, name)?;
         operation.call(&mut store, (length as i32, source_end as i32, 0))?;
         let error = operation
             .call(&mut store, (length as i32 + 1, source_end as i32, 0))
@@ -473,7 +490,8 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
         .call(&mut store, (4096, 3, 4096))?;
     assert_eq!(&memory.data(&store)[4096..8192], &[3; 4096]);
     assert_eq!(budget.pages.load(Ordering::Relaxed).count_ones(), 2);
-    memory.data_mut_range(&mut store, 4096..4098)?
+    memory
+        .data_mut_range(&mut store, 4096..4098)?
         .copy_from_slice(&[6, 7]);
     assert_eq!(&memory.data(&store)[4096..4098], &[6, 7]);
     memory.write(&mut store, 0, &[1, 2, 3, 4, 5])?;
