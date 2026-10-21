@@ -1,0 +1,2361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Sun, 18 Oct 2026 13:23:33 +0800
+Subject: [PATCH 2/3] runtime: enforce budgets before protected-memory writes
+
+Allow an embedder to reject writes to protected linear-memory pages without
+unwinding through native host frames. Add Store-bound signal rejection,
+writable-range preflight for host APIs and bulk-memory operations, and
+pre-exposure checks for unshared linear-memory growth. Preserve ordinary
+resource and type limits, including both synchronous and asynchronous
+limiters, and distinguish internal GC heap growth through a compatible
+default callback.
+
+Make bulk copy/fill libcalls return trapping results and handle them in
+both native compilers. Version engine metadata and compilation identities
+so artifacts using the former calling convention are rejected even when
+optional version-string checking is disabled. Keep polling artifacts
+separate from ordinary epoch-check artifacts.
+
+Cover protected writes, cross-memory operations, denied growth, pooling,
+GC allocation accounting, cancellation and existing metering behavior.
+The maintained memory-write, limiter and metering cases pass on Linux
+x86-64, including Cranelift and Winch protected-write execution.
+---
+ crates/environ/src/builtin.rs                 |   4 +-
+ crates/wasmtime/src/compile/code_builder.rs   |   1 +
+ crates/wasmtime/src/engine.rs                 |   2 +
+ crates/wasmtime/src/engine/serialization.rs   |  16 +-
+ crates/wasmtime/src/runtime/func.rs           |   2 +-
+ crates/wasmtime/src/runtime/limits.rs         |  45 +-
+ crates/wasmtime/src/runtime/memory.rs         | 116 +++-
+ .../wasmtime/src/runtime/module/registry.rs   |  53 ++
+ crates/wasmtime/src/runtime/store.rs          |  55 +-
+ crates/wasmtime/src/runtime/store/gc.rs       |   2 +-
+ crates/wasmtime/src/runtime/trap.rs           |  10 +-
+ crates/wasmtime/src/runtime/unix.rs           | 142 ++++-
+ crates/wasmtime/src/runtime/vm/component.rs   |   2 +-
+ .../wasmtime/src/runtime/vm/debug_builtins.rs |   2 +-
+ crates/wasmtime/src/runtime/vm/instance.rs    |   6 +-
+ .../runtime/vm/instance/allocator/pooling.rs  |  14 +-
+ .../instance/allocator/pooling/memory_pool.rs |   5 +
+ crates/wasmtime/src/runtime/vm/interpreter.rs |   2 +-
+ crates/wasmtime/src/runtime/vm/libcalls.rs    |  37 +-
+ crates/wasmtime/src/runtime/vm/memory.rs      |  87 +--
+ .../src/runtime/vm/memory/shared_memory.rs    |  16 +-
+ .../src/runtime/vm/sys/unix/signals.rs        |  11 +-
+ .../vm/sys/windows/vectored_exceptions.rs     |   2 +-
+ .../wasmtime/src/runtime/vm/traphandlers.rs   | 100 +++-
+ tests/all/limits.rs                           | 183 ++++++
+ tests/all/main.rs                             |   1 +
+ tests/all/memory_write_limits.rs              | 537 ++++++++++++++++++
+ tests/all/metering_polling.rs                 |   2 +-
+ winch/codegen/src/codegen/mod.rs              |  12 +-
+ 29 files changed, 1322 insertions(+), 145 deletions(-)
+ create mode 100644 tests/all/memory_write_limits.rs
+
+diff --git a/crates/environ/src/builtin.rs b/crates/environ/src/builtin.rs
+index fc390ef50965e08b0d718a70ec67505706fb82d0..27398d1af97f259aa0ccde33fc4042ce9076991e 100644
+--- a/crates/environ/src/builtin.rs
++++ b/crates/environ/src/builtin.rs
+@@ -6,9 +6,9 @@ macro_rules! foreach_builtin_function {
+             // Returns an index for wasm's `memory.grow` builtin function.
+             memory_grow(vmctx: vmctx, delta: u64, index: u32) -> pointer;
+             // Returns an index for wasm's `memory.copy`
+-            memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size);
++            memory_copy(vmctx: vmctx, dst: pointer, src: pointer, len: size) -> bool;
+             // Returns an index for wasm's `memory.fill` instruction.
+-            memory_fill(vmctx: vmctx, dst: pointer, val: u32, len: size);
++            memory_fill(vmctx: vmctx, dst: pointer, val: u32, len: size) -> bool;
+             // Returns the current size of the passive `elem` segment.
+             passive_elem_segment_len(vmctx: vmctx, elem: u32) -> size;
+             // Returns the base address of the passive `elem` segment.
+diff --git a/crates/wasmtime/src/compile/code_builder.rs b/crates/wasmtime/src/compile/code_builder.rs
+index 6915e9ff5cc704eb51bda92ed2347a40c19fd49d..5b75a529420e664ebb444d04e1d598f2a3e6a5f9 100644
+--- a/crates/wasmtime/src/compile/code_builder.rs
++++ b/crates/wasmtime/src/compile/code_builder.rs
+@@ -847,6 +847,7 @@ pub struct HashedEngineCompileEnv<'a>(pub &'a Engine);
+ 
+ impl std::hash::Hash for HashedEngineCompileEnv<'_> {
+     fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
++        crate::engine::ENGINE_METADATA_VERSION.hash(hasher);
+         // Hash the compiler's state based on its target and configuration.
+         if let Some(compiler) = self.0.compiler() {
+             compiler.triple().hash(hasher);
+diff --git a/crates/wasmtime/src/engine.rs b/crates/wasmtime/src/engine.rs
+index 16d666a4f19222ee0f164f7f278f819ec39d12a3..60b2ec540be0e4bd35b8d62cc2a50e6c16f8f9c3 100644
+--- a/crates/wasmtime/src/engine.rs
++++ b/crates/wasmtime/src/engine.rs
+@@ -18,6 +18,8 @@ use wasmparser::WasmFeatures;
+ use wasmtime_environ::{FlagValue, ObjectKind, TripleExt, Tunables};
+ 
+ mod serialization;
++#[cfg(any(feature = "cranelift", feature = "winch"))]
++pub(crate) use serialization::ENGINE_METADATA_VERSION;
+ 
+ /// An `Engine` which is a global context for compilation and management of wasm
+ /// modules.
+diff --git a/crates/wasmtime/src/engine/serialization.rs b/crates/wasmtime/src/engine/serialization.rs
+index afeee8bf30ef299f04ea6b05b30d4001d96c3072..195381e505227995a7505a7a001b183017bb7643 100644
+--- a/crates/wasmtime/src/engine/serialization.rs
++++ b/crates/wasmtime/src/engine/serialization.rs
+@@ -37,10 +37,14 @@ use object::{
+ use serde_derive::{Deserialize, Serialize};
+ use wasmtime_environ::{FlagValue, ObjectKind, OperatorCostStrategy, Tunables, obj};
+ 
+-const LEGACY_VERSION: u8 = 0;
+-// Older runtimes must reject artifacts that omit internal epoch checks, even
+-// when the embedder disables the module version string check.
+-const FUEL_EPOCH_POLLING_VERSION: u8 = 1;
++// Bulk-memory libcalls now return a trapping result. Code built with the old
++// calling convention must not ignore a denied write, nor may an older runtime
++// supply a void-returning libcall to a new trampoline. This check is independent
++// of the optional version string and also participates in compilation cache keys.
++pub(crate) const ENGINE_METADATA_VERSION: u8 = 2;
++// Keep polling artifacts distinct: replacing their interval with zero must not
++// admit code without internal epoch checks to an ordinary epoch engine.
++const FUEL_EPOCH_POLLING_VERSION: u8 = 3;
+ 
+ /// Verifies that the serialized engine in `mmap` is compatible with the
+ /// `engine` provided.
+@@ -106,7 +110,7 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
+     let (first, data) = data
+         .split_first()
+         .ok_or_else(|| format_err!("invalid engine section"))?;
+-    if !matches!(*first, LEGACY_VERSION | FUEL_EPOCH_POLLING_VERSION) {
++    if !matches!(*first, ENGINE_METADATA_VERSION | FUEL_EPOCH_POLLING_VERSION) {
+         bail!("mismatched version in engine section");
+     }
+     let (len, data) = data
+@@ -154,7 +158,7 @@ pub fn append_compiler_info(engine: &Engine, obj: &mut Object<'_>, metadata: &Me
+     let mut data = Vec::new();
+     let interval = metadata.tunables.fuel_epoch_poll_interval;
+     data.push(if interval == 0 {
+-        LEGACY_VERSION
++        ENGINE_METADATA_VERSION
+     } else {
+         FUEL_EPOCH_POLLING_VERSION
+     });
+diff --git a/crates/wasmtime/src/runtime/func.rs b/crates/wasmtime/src/runtime/func.rs
+index c8ab027e51d3fe26c848bf6a9b5be499ff4d6c25..61580646c183906f51fe067aee1483db08740d3d 100644
+--- a/crates/wasmtime/src/runtime/func.rs
++++ b/crates/wasmtime/src/runtime/func.rs
+@@ -2417,7 +2417,7 @@ impl HostFunc {
+         // SAFETY: this is an entrypoint of wasm which requires correct type
+         // ascription of `T` itself, meaning that this should be safe to call
+         // both `enter_host_from_wasm` as well as `unchecked_context_mut`.
+-        unsafe { vm::Instance::enter_host_from_wasm(caller_vmctx, run) }
++        unsafe { vm::Instance::enter_host_from_wasm(caller_vmctx, true, run) }
+     }
+     /// Analog of [`Func::new_unchecked`]
+     ///
+diff --git a/crates/wasmtime/src/runtime/limits.rs b/crates/wasmtime/src/runtime/limits.rs
+index 41a40b6529c87f8f18ab3b302b2c1acafc51a4fb..c4e66cbdc4f53351e87e1677ad122a61237ec2fc 100644
+--- a/crates/wasmtime/src/runtime/limits.rs
++++ b/crates/wasmtime/src/runtime/limits.rs
+@@ -39,8 +39,10 @@ pub trait ResourceLimiter: Send {
+     ///   instance allocator, also in bytes. A value of `None`
+     ///   indicates that the linear memory is unbounded.
+     ///
+-    /// The `current` and `desired` amounts are guaranteed to always be
+-    /// multiples of the WebAssembly page size, 64KiB.
++    /// For linear memories, `current` and `desired` are multiples of the
++    /// memory's page size (normally 64KiB). The default implementation of
++    /// [`Self::gc_heap_growing`] also forwards internal GC heap allocations to
++    /// this method; those sizes follow the internal GC heap's page alignment.
+     ///
+     /// This function is not invoked when the requested size doesn't fit in
+     /// `usize`. Additionally this function is not invoked for shared memories
+@@ -73,10 +75,32 @@ pub trait ResourceLimiter: Send {
+         maximum: Option<usize>,
+     ) -> Result<bool>;
+ 
+-    /// Notifies the resource limiter that growing a linear memory, permitted by
+-    /// the `memory_growing` method, has failed.
++    /// Notifies the limiter that Wasmtime's internal GC heap is being allocated
++    /// or grown. This is distinct from a WebAssembly linear memory, including
++    /// a language runtime's GC heap implemented inside that linear memory.
++    /// Sizes are in bytes and follow the internal GC heap's page alignment.
++    ///
++    /// The default forwards to [`Self::memory_growing`], preserving the combined
++    /// accounting of existing limiters. Override this method when linear memory
++    /// and the internal GC heap need different accounting. The return values
++    /// control this growth attempt as for [`Self::memory_growing`], with growth
++    /// failures reported through [`Self::memory_grow_failed`]. GC may collect
++    /// and retry an allocation after refused or failed growth, including an
++    /// error return. A successful retry need not report that error to the guest.
++    fn gc_heap_growing(
++        &mut self,
++        current: usize,
++        desired: usize,
++        maximum: Option<usize>,
++    ) -> Result<bool> {
++        self.memory_growing(current, desired, maximum)
++    }
++
++    /// Notifies the resource limiter that growing a linear memory or internal
++    /// GC heap has failed. This may follow a successful `memory_growing` or
++    /// `gc_heap_growing` callback, or a type-limit failure before either callback.
+     ///
+-    /// Note that this method is not called if `memory_growing` returns an
++    /// Note that this method is not called if either growth callback returns an
+     /// error.
+     ///
+     /// Reasons for failure include: the growth exceeds the `maximum` passed to
+@@ -179,6 +203,17 @@ pub trait ResourceLimiterAsync: Send {
+         maximum: Option<usize>,
+     ) -> Result<bool>;
+ 
++    /// Async version of [`ResourceLimiter::gc_heap_growing`]. The default
++    /// forwards to [`Self::memory_growing`].
++    async fn gc_heap_growing(
++        &mut self,
++        current: usize,
++        desired: usize,
++        maximum: Option<usize>,
++    ) -> Result<bool> {
++        self.memory_growing(current, desired, maximum).await
++    }
++
+     /// Identical to [`ResourceLimiter::memory_grow_failed`]
+     fn memory_grow_failed(&mut self, error: crate::Error) -> Result<()> {
+         log::debug!("ignoring memory growth failure error: {error:?}");
+diff --git a/crates/wasmtime/src/runtime/memory.rs b/crates/wasmtime/src/runtime/memory.rs
+index ab418253d4ea72f95d6b2c8a572dffd053e181da..f8e3a1ae16c02d7d78d205de08a3e66b2a93961b 100644
+--- a/crates/wasmtime/src/runtime/memory.rs
++++ b/crates/wasmtime/src/runtime/memory.rs
+@@ -14,22 +14,33 @@ use wasmtime_environ::DefinedMemoryIndex;
+ 
+ pub use crate::runtime::vm::WaitResult;
+ 
+-/// Error for out of bounds [`Memory`] access.
++/// Error for out of bounds [`Memory`] access or a denied host write.
+ #[derive(Debug)]
+ #[non_exhaustive]
+ pub struct MemoryAccessError {
+     // Keep struct internals private for future extensibility.
+-    _private: (),
++    write_denied: bool,
+ }
+ 
+ impl fmt::Display for MemoryAccessError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        write!(f, "out of bounds memory access")
++        f.write_str(if self.write_denied {
++            "memory write rejected by the Store's write handler"
++        } else {
++            "out of bounds memory access"
++        })
+     }
+ }
+ 
+ impl core::error::Error for MemoryAccessError {}
+ 
++impl MemoryAccessError {
++    /// Whether the access was in bounds but denied by the Store's write handler.
++    pub fn is_write_denied(&self) -> bool {
++        self.write_denied
++    }
++}
++
+ /// A WebAssembly linear memory.
+ ///
+ /// WebAssembly memories represent a contiguous array of bytes that have a size
+@@ -51,13 +62,16 @@ impl core::error::Error for MemoryAccessError {}
+ /// * [`Memory::write`]
+ /// * [`Memory::data`]
+ /// * [`Memory::data_mut`]
++/// * [`Memory::data_mut_range`]
++/// * [`Memory::data_and_store_mut`]
+ ///
+ /// Note that all of these consider the entire store context as borrowed for the
+ /// duration of the call or the duration of the returned slice. This largely
+ /// means that while the function is running you'll be unable to borrow anything
+-/// else from the store. This includes getting access to the `T` on
+-/// [`Store<T>`](crate::Store), but it also means that you can't recursively
+-/// call into WebAssembly for instance.
++/// else from the store or recursively call into WebAssembly. The
++/// [`Memory::data_and_store_mut`] method allows access to the `T` on
++/// [`Store<T>`](crate::Store) alongside the memory slice because those borrows
++/// are disjoint.
+ ///
+ /// If you'd like to dip your toes into handling [`Memory`] in a more raw
+ /// fashion (e.g. by using raw pointers or raw slices), then there's a few
+@@ -344,9 +358,7 @@ impl Memory {
+     ///
+     /// # Errors
+     ///
+-    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+-    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+-    /// details on Wasmtime's out-of-memory handling.
++    /// Returns [`MemoryAccessError`] if the range is out of bounds.
+     ///
+     /// # Panics
+     ///
+@@ -362,7 +374,9 @@ impl Memory {
+             .data(&store)
+             .get(offset..)
+             .and_then(|s| s.get(..buffer.len()))
+-            .ok_or(MemoryAccessError { _private: () })?;
++            .ok_or(MemoryAccessError {
++                write_denied: false,
++            })?;
+         buffer.copy_from_slice(slice);
+         Ok(())
+     }
+@@ -375,9 +389,10 @@ impl Memory {
+     ///
+     /// # Errors
+     ///
+-    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+-    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+-    /// details on Wasmtime's out-of-memory handling.
++    /// Returns [`MemoryAccessError`] for an out-of-bounds access or when the
++    /// Store's write handler rejects the destination range. A rejected write
++    /// leaves the contents unchanged; [`MemoryAccessError::is_write_denied`]
++    /// distinguishes the two cases.
+     ///
+     /// # Panics
+     ///
+@@ -388,15 +403,55 @@ impl Memory {
+         offset: usize,
+         buffer: &[u8],
+     ) -> Result<(), MemoryAccessError> {
+-        let mut context = store.as_context_mut();
+-        self.data_mut(&mut context)
+-            .get_mut(offset..)
+-            .and_then(|s| s.get_mut(..buffer.len()))
+-            .ok_or(MemoryAccessError { _private: () })?
++        let store = store.as_context_mut();
++        // Preserve the ownership check even when the requested range overflows.
++        self.instance.assert_belongs_to(store.0.id());
++        let end = offset.checked_add(buffer.len()).ok_or(MemoryAccessError {
++            write_denied: false,
++        })?;
++        self.data_mut_range(store, offset..end)?
+             .copy_from_slice(buffer);
+         Ok(())
+     }
+ 
++    /// Returns a writable subrange, checking the Store's optional write handler
++    /// before granting access. A rejected range returns an error without changing
++    /// memory contents. The permission covers the entire lifetime of the returned
++    /// slice. This avoids granting write access to the whole memory when an
++    /// embedder accounts for private copies of protected pages.
++    ///
++    /// # Errors
++    ///
++    /// Returns an error if the range is reversed, out of bounds, or denied by the
++    /// write handler. Bounds are checked before calling the handler, and empty
++    /// in-bounds ranges do not call it.
++    ///
++    /// # Panics
++    ///
++    /// Panics if this memory doesn't belong to `store`.
++    pub fn data_mut_range<'a, T: 'static>(
++        &self,
++        store: impl Into<StoreContextMut<'a, T>>,
++        range: core::ops::Range<usize>,
++    ) -> Result<&'a mut [u8], MemoryAccessError> {
++        let store = store.into();
++        let definition = store[self.instance].memory(self.index);
++        debug_assert!(!self.ty(&store).is_shared());
++        let length = range
++            .end
++            .checked_sub(range.start)
++            .filter(|_| range.end <= definition.current_length())
++            .ok_or(MemoryAccessError {
++                write_denied: false,
++            })?;
++        let pointer = unsafe { definition.base.as_ptr().add(range.start) };
++        store
++            .0
++            .prepare_memory_write(pointer, length)
++            .map_err(|_| MemoryAccessError { write_denied: true })?;
++        Ok(unsafe { slice::from_raw_parts_mut(pointer, length) })
++    }
++
+     /// Returns this memory as a native Rust slice.
+     ///
+     /// Note that this method will consider the entire store context provided as
+@@ -421,17 +476,17 @@ impl Memory {
+     ///
+     /// # Panics
+     ///
+-    /// Panics if this memory doesn't belong to `store`.
++    /// Panics if this memory doesn't belong to `store`, or if its write handler
++    /// rejects write access to the entire memory. Use [`Memory::data_mut_range`]
++    /// to request a smaller range and receive a recoverable error.
+     pub fn data_mut<'a, T: 'static>(
+         &self,
+         store: impl Into<StoreContextMut<'a, T>>,
+     ) -> &'a mut [u8] {
+-        unsafe {
+-            let store = store.into();
+-            let definition = store[self.instance].memory(self.index);
+-            debug_assert!(!self.ty(store).is_shared());
+-            slice::from_raw_parts_mut(definition.base.as_ptr(), definition.current_length())
+-        }
++        let store = store.into();
++        let length = self.data_size(&store);
++        self.data_mut_range(store, 0..length)
++            .expect("whole-memory write access denied; use Memory::data_mut_range")
+     }
+ 
+     /// Same as [`Memory::data_mut`], but also returns the `T` from the
+@@ -445,7 +500,8 @@ impl Memory {
+     ///
+     /// # Panics
+     ///
+-    /// Panics if this memory doesn't belong to `store`.
++    /// Panics if this memory doesn't belong to `store`, or if its write handler
++    /// rejects write access to the entire memory, as with [`Memory::data_mut`].
+     pub fn data_and_store_mut<'a, T: 'static>(
+         &self,
+         store: impl Into<StoreContextMut<'a, T>>,
+@@ -470,6 +526,11 @@ impl Memory {
+     /// Returns the base pointer, in the host's address space, that the memory
+     /// is located at.
+     ///
++    /// This does not invoke the Store's write handler. Before writing through
++    /// this pointer to protected memory, the caller must obtain permission from
++    /// its memory controller and keep the range writable until the write ends.
++    /// Prefer [`Memory::data_mut_range`] for checked, recoverable access.
++    ///
+     /// For more information and examples see the documentation on the
+     /// [`Memory`] type.
+     ///
+@@ -666,10 +727,11 @@ impl Memory {
+         limiter: Option<&mut StoreResourceLimiter<'_>>,
+         delta: u64,
+     ) -> Result<u64> {
++        let grow_handler = store.memory_grow_handler.clone();
+         let result = self
+             .instance
+             .get_mut(store)
+-            .memory_grow(limiter, self.index, delta)
++            .memory_grow(limiter, self.index, delta, grow_handler.as_deref())
+             .await?;
+         match result {
+             Some(size) => {
+diff --git a/crates/wasmtime/src/runtime/module/registry.rs b/crates/wasmtime/src/runtime/module/registry.rs
+index f056a8d1de163a11d85437f2d216fb915e509f7e..ae938cff9f3e767909c74159e7540ffdf4f83d1f 100644
+--- a/crates/wasmtime/src/runtime/module/registry.rs
++++ b/crates/wasmtime/src/runtime/module/registry.rs
+@@ -3,6 +3,8 @@
+ use crate::code::{EngineCode, EngineCodePC, ModuleWithCode, StoreCode, StoreCodePC};
+ #[cfg(feature = "component-model")]
+ use crate::component::Component;
++#[cfg(all(feature = "std", has_native_signals, unix))]
++use crate::runtime::vm::StoreBox;
+ use crate::runtime::vm::VMWasmCallFunction;
+ use crate::sync::{OnceLock, RwLock};
+ use crate::vm::CompiledModuleId;
+@@ -12,6 +14,8 @@ use alloc::sync::Arc;
+ use core::marker::PhantomData;
+ use core::ops::Range;
+ use core::ptr::NonNull;
++#[cfg(all(feature = "std", has_native_signals, unix))]
++use core::sync::atomic::{AtomicPtr, Ordering};
+ use wasmtime_environ::{
+     CompiledFunctionsTable, FuncKey, StaticModuleIndex, VMSharedTypeIndex,
+     collections::btree_map::Entry,
+@@ -76,8 +80,17 @@ pub struct ModuleRegistry {
+     /// Every module is placed in this map, but not every module will
+     /// be in a LoadedCode entry, because the module may have no text.
+     modules: TryBTreeMap<RegisteredModuleId, Module>,
++
++    // Only enabled for an embedder that can reject signals. The pointer is
++    // published before the old immutable ranges are freed, so a signal on this
++    // Store's thread can inspect either snapshot without locks or allocations.
++    #[cfg(all(feature = "std", has_native_signals, unix))]
++    signal_code_ranges: Option<(SignalCodeRanges, StoreBox<TryVec<Range<usize>>>)>,
+ }
+ 
++#[cfg(all(feature = "std", has_native_signals, unix))]
++pub(crate) type SignalCodeRanges = Arc<AtomicPtr<TryVec<Range<usize>>>>;
++
+ struct LoadedCode {
+     /// The StoreCode in this range.
+     code: StoreCode,
+@@ -150,6 +163,35 @@ impl<'a> ModuleOrComponent<'a> {
+ }
+ 
+ impl ModuleRegistry {
++    #[cfg(all(feature = "std", has_native_signals, unix))]
++    fn collect_signal_code_ranges(&self) -> Result<StoreBox<TryVec<Range<usize>>>, OutOfMemory> {
++        let mut ranges = TryVec::new();
++        for code in self.loaded_code.values() {
++            let range = code.code.text_range();
++            if range.start != range.end {
++                ranges.push(range.start.raw()..range.end.raw())?;
++            }
++        }
++        StoreBox::new(ranges)
++    }
++
++    #[cfg(all(feature = "std", has_native_signals, unix))]
++    pub(crate) fn enable_signal_traps(&mut self) -> Result<(), OutOfMemory> {
++        if self.signal_code_ranges.is_none() {
++            let ranges = self.collect_signal_code_ranges()?;
++            let pointer = try_new::<Arc<_>>(AtomicPtr::new(ranges.get().as_ptr()))?;
++            self.signal_code_ranges = Some((pointer, ranges));
++        }
++        Ok(())
++    }
++
++    #[cfg(all(feature = "std", has_native_signals, unix))]
++    pub(crate) fn signal_code_ranges(&self) -> Option<SignalCodeRanges> {
++        self.signal_code_ranges
++            .as_ref()
++            .map(|(pointer, _)| pointer.clone())
++    }
++
+     /// Get a previously-registered module by id.
+     pub fn module_by_id(&self, id: RegisteredModuleId) -> Option<&Module> {
+         self.modules.get(id)
+@@ -332,6 +374,17 @@ impl ModuleRegistry {
+             breakpoint_state.update(&mut loaded_code.code, module)?;
+         }
+ 
++        #[cfg(all(feature = "std", has_native_signals, unix))]
++        if self.signal_code_ranges.is_some() {
++            let ranges = self.collect_signal_code_ranges()?;
++            let (pointer, previous) = self.signal_code_ranges.as_mut().unwrap();
++            // A host callback may register a module and pass its funcref back
++            // to the current activation. Publish to every activation of this
++            // Store before that new code can execute.
++            pointer.store(ranges.get().as_ptr(), Ordering::Release);
++            *previous = ranges;
++        }
++
+         Ok(id)
+     }
+ 
+diff --git a/crates/wasmtime/src/runtime/store.rs b/crates/wasmtime/src/runtime/store.rs
+index 8784dbe0c5db801049dfb8ddbb381247e135b5fe..bcef99715ef90f418e2657606f62c650ffe679a7 100644
+--- a/crates/wasmtime/src/runtime/store.rs
++++ b/crates/wasmtime/src/runtime/store.rs
+@@ -329,11 +329,22 @@ impl StoreResourceLimiter<'_> {
+         current: usize,
+         desired: usize,
+         maximum: Option<usize>,
++        kind: wasmtime_environ::MemoryKind,
+     ) -> Result<bool, Error> {
+-        match self {
+-            Self::Sync(s) => s.memory_growing(current, desired, maximum),
++        use wasmtime_environ::MemoryKind;
++        match (self, kind) {
++            (Self::Sync(s), MemoryKind::LinearMemory) => {
++                s.memory_growing(current, desired, maximum)
++            }
++            (Self::Sync(s), MemoryKind::GcHeap) => s.gc_heap_growing(current, desired, maximum),
+             #[cfg(feature = "async")]
+-            Self::Async(s) => s.memory_growing(current, desired, maximum).await,
++            (Self::Async(s), MemoryKind::LinearMemory) => {
++                s.memory_growing(current, desired, maximum).await
++            }
++            #[cfg(feature = "async")]
++            (Self::Async(s), MemoryKind::GcHeap) => {
++                s.gc_heap_growing(current, desired, maximum).await
++            }
+         }
+     }
+ 
+@@ -430,6 +441,8 @@ impl<T> DerefMut for StoreInner<T> {
+     }
+ }
+ 
++pub(crate) type MemoryGrowHandler = dyn Fn(usize, usize, usize) -> bool + Send + Sync;
++
+ /// Monomorphic storage for a `Store<T>`.
+ ///
+ /// This structure contains the bulk of the metadata about a `Store`. This is
+@@ -471,6 +484,8 @@ pub struct StoreOpaque {
+     instances: TryPrimaryMap<InstanceId, StoreInstance>,
+ 
+     signal_handler: Option<SignalHandler>,
++    memory_write_handler: Option<Box<dyn Fn(usize, usize) -> bool + Send + Sync>>,
++    pub(crate) memory_grow_handler: Option<alloc::sync::Arc<MemoryGrowHandler>>,
+     modules: ModuleRegistry,
+     func_refs: FuncRefs,
+     host_globals: TryPrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>>,
+@@ -733,6 +748,8 @@ impl<T> Store<T> {
+             continuations: Vec::new(),
+             instances: TryPrimaryMap::new(),
+             signal_handler: None,
++            memory_write_handler: None,
++            memory_grow_handler: None,
+             gc_store: None,
+             #[cfg(feature = "gc")]
+             gc_data: Default::default(),
+@@ -1780,6 +1797,38 @@ impl StoreOpaque {
+         self.signal_handler = handler;
+     }
+ 
++    #[cfg(all(feature = "std", has_native_signals, unix))]
++    pub fn set_signal_handler_with_trap(&mut self, handler: SignalHandler) -> Result<()> {
++        self.modules.enable_signal_traps()?;
++        self.signal_handler = Some(handler);
++        Ok(())
++    }
++
++    #[cfg(all(feature = "std", has_native_signals, unix))]
++    pub fn set_memory_write_handler(
++        &mut self,
++        handler: Box<dyn Fn(usize, usize) -> bool + Send + Sync>,
++    ) {
++        self.memory_write_handler = Some(handler);
++    }
++
++    pub(crate) fn prepare_memory_write(
++        &self,
++        destination: *mut u8,
++        length: usize,
++    ) -> core::result::Result<(), wasmtime_environ::Trap> {
++        // An empty range cannot privatize a page, including a one-past-end range.
++        if length != 0
++            && self
++                .memory_write_handler
++                .as_ref()
++                .is_some_and(|handler| !handler(destination as usize, length))
++        {
++            return Err(wasmtime_environ::Trap::AllocationTooLarge);
++        }
++        Ok(())
++    }
++
+     #[inline]
+     pub fn vm_store_context(&self) -> &VMStoreContext {
+         &self.vm_store_context
+diff --git a/crates/wasmtime/src/runtime/store/gc.rs b/crates/wasmtime/src/runtime/store/gc.rs
+index 09a63ba2cf01d1221b09cc9833dfe0f61cbdcdc7..1cca02e8def181bdb43788f00aed6a0199762494 100644
+--- a/crates/wasmtime/src/runtime/store/gc.rs
++++ b/crates/wasmtime/src/runtime/store/gc.rs
+@@ -383,7 +383,7 @@ impl StoreOpaque {
+         // afterwards.
+         unsafe {
+             heap.memory
+-                .grow(delta_pages_for_alloc, limiter)
++                .grow(delta_pages_for_alloc, limiter, None)
+                 .await
+                 .context(GcHeapGrowthFailed)?
+                 .ok_or(GcHeapGrowthFailed)?;
+diff --git a/crates/wasmtime/src/runtime/trap.rs b/crates/wasmtime/src/runtime/trap.rs
+index e7d79cb4bf9995d6f3a38122e5a3bb876fdbfbd4..2d5a60b881ea6af7a206086e2e642acac32e0e6b 100644
+--- a/crates/wasmtime/src/runtime/trap.rs
++++ b/crates/wasmtime/src/runtime/trap.rs
+@@ -31,10 +31,12 @@ use wasmtime_environ::{
+ /// trap, or otherwise it's whatever the host created the error with when
+ /// returning an error for a host call.
+ ///
+-/// Any error which happens while WebAssembly is executing will also, by
+-/// default, capture a backtrace of the wasm frames while executing. This
+-/// backtrace is represented with a [`WasmBacktrace`] instance and is attached
+-/// to the [`wasmtime::Error`] return value as a
++/// Errors which happen while WebAssembly is executing will also, by default,
++/// capture a backtrace of the wasm frames while executing. Traps requested by
++/// an embedder's custom signal handler omit backtraces and coredumps so that
++/// rejection can remain allocation-free and lock-free in signal context. A
++/// captured backtrace is represented with a [`WasmBacktrace`] instance and is
++/// attached to the [`wasmtime::Error`] return value as a
+ /// [`context`](crate::Error::context). Inspecting a [`WasmBacktrace`] can be
+ /// done with the [`downcast_ref`](crate::Error::downcast_ref) function. For
+ /// information on this see the [`WasmBacktrace`] documentation.
+diff --git a/crates/wasmtime/src/runtime/unix.rs b/crates/wasmtime/src/runtime/unix.rs
+index bb2c0ca64c71be332c1419b5e4ac7e6b77bf3cb3..d52fba57190267fa4703a409f8cafb1d4c57e866 100644
+--- a/crates/wasmtime/src/runtime/unix.rs
++++ b/crates/wasmtime/src/runtime/unix.rs
+@@ -1,9 +1,9 @@
+ //! Unix-specific extension for the `wasmtime` crate.
+ //!
+-//! This module is only available on Unix targets, for example Linux. Note that
+-//! this module is notably not available on macOS or Windows.  Note that the
+-//! import path for this module is `wasmtime::unix::...`, which is intended to
+-//! emphasize that it is platform-specific.
++//! This module is only available on Unix targets with the `std` feature, for
++//! example Linux and macOS. Individual methods require native signal support.
++//! The import path for this module is `wasmtime::unix::...`, which is intended
++//! to emphasize that it is platform-specific.
+ //!
+ //! The traits contained in this module are intended to extend various types
+ //! throughout the `wasmtime` crate with extra functionality that's only
+@@ -27,6 +27,101 @@ pub trait StoreExt {
+             + Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool
+             + Send
+             + Sync;
++
++    /// Installs a signal handler which can reject an embedder-managed memory
++    /// fault with a WebAssembly trap. `Ok(true)` resumes the faulting instruction;
++    /// `Ok(false)` delegates to the ordinary trap handler. `Err(trap)` unwinds
++    /// only when the faulting PC belongs to code registered in this Store.
++    /// The trap is returned through the innermost active call into the Store.
++    /// To keep rejection allocation-free and lock-free in the signal handler,
++    /// these traps do not capture a Wasm backtrace or coredump. Protected-page
++    /// rejection is maintained on Linux x86-64 with native execution and
++    /// signals-based traps enabled; Pulley and macOS Mach exceptions do not use
++    /// this signal rejection interface.
++    ///
++    /// # Errors
++    ///
++    /// Returns an allocation error if the Store's code ranges cannot be prepared
++    /// for signal-safe lookup. The existing handler remains installed on error.
++    ///
++    /// # Safety
++    ///
++    /// The handler must be async-signal-safe and must only reject faults caused
++    /// by the embedder's deliberate memory protection. It must not reenter the
++    /// Store, invalidate its memory, or access mutably borrowed Store data.
++    /// Native host frames cannot be unwound this way: host and bulk-memory
++    /// writes need a writable-range check before they write. The handler must
++    /// not allocate, lock, or panic.
++    #[cfg(has_native_signals)]
++    unsafe fn set_signal_handler_with_trap<H>(&mut self, handler: H) -> crate::Result<()>
++    where
++        H: 'static
++            + Fn(
++                libc::c_int,
++                *const libc::siginfo_t,
++                *const libc::c_void,
++            ) -> core::result::Result<bool, crate::Trap>
++            + Send
++            + Sync;
++
++    /// Checks destination ranges before host APIs or bulk-memory libcalls write.
++    /// Returning false rejects the write before its contents are changed.
++    /// Scalar guest stores still require a signal handler when memory is protected.
++    /// This hook covers the safe mutable `Memory` APIs and native bulk-memory
++    /// libcalls. It is not a memory-growth, initialization, reset, or component
++    /// canonical-ABI write hook.
++    ///
++    /// # Safety
++    ///
++    /// The callback receives a valid destination address and length. On success,
++    /// that range must remain writable for the entire operation, including the
++    /// lifetime of any mutable slice returned by `Memory::data_mut_range`,
++    /// `Memory::data_mut`, or `Memory::data_and_store_mut`. Returning from this
++    /// callback, or from an API returning a slice, does not end that permission.
++    /// Protection may only be restored after all such borrows have ended.
++    ///
++    /// Raw pointer writes must obtain the same permission separately. The hook
++    /// must not reenter the Store, access its borrowed data, grow or relocate
++    /// memory, or invalidate any outstanding borrow. A hook used to enforce a
++    /// copy budget must cover every managed memory in this Store. Empty ranges
++    /// do not invoke it. Bulk libcalls may also operate on tables and GC arrays;
++    /// ranges outside the managed linear memories must be accepted unchanged.
++    ///
++    /// The embedder must keep other native writers, including memory allocation,
++    /// growth/relocation and component canonical-ABI lowering, away from protected
++    /// destinations or obtain permission for their full destination first. Shared
++    /// memory requires coordination with every writer and Store using it; this
++    /// per-Store hook does not provide that coordination.
++    #[cfg(has_native_signals)]
++    unsafe fn set_memory_write_handler<H>(&mut self, handler: H)
++    where
++        H: 'static + Fn(usize, usize) -> bool + Send + Sync;
++
++    /// Checks unshared linear-memory growth before exposing its new bytes.
++    /// Receives the current base address, current byte length and requested byte
++    /// length after ordinary resource and type limits have accepted the growth.
++    /// Returning false traps with [`crate::Trap::AllocationTooLarge`]; guest code
++    /// does not receive a recoverable `memory.grow` failure. Host growth returns
++    /// that error normally.
++    ///
++    /// This hook covers host and guest growth of unshared linear memories. It
++    /// does not cover initial allocation, shared memory or the internal GC heap.
++    /// Lengths are logical byte lengths, not rounded to host page boundaries.
++    /// Zero growth does not invoke it. Acceptance reserves permission; an OS or
++    /// allocator error may still prevent growth. Such failures retain any charge
++    /// made by this hook until the embedder reconciles or disposes the memory.
++    ///
++    /// # Safety
++    ///
++    /// The handler must not reenter the Store, access borrowed Store data, or
++    /// access the requested tail, which is not yet accessible. When used with
++    /// page protection, the embedder must guarantee a stable memory reservation:
++    /// this callback does not make relocating or shared allocations safe. All
++    /// other native writers still require the write hook or separate permission.
++    #[cfg(has_native_signals)]
++    unsafe fn set_memory_grow_handler<H>(&mut self, handler: H)
++    where
++        H: 'static + Fn(usize, usize, usize) -> bool + Send + Sync;
+ }
+ 
+ impl<T> StoreExt for Store<T> {
+@@ -40,6 +135,43 @@ impl<T> StoreExt for Store<T> {
+     {
+         self.as_context_mut()
+             .0
+-            .set_signal_handler(Some(Box::new(handler)));
++            .set_signal_handler(Some(Box::new(move |signal, info, context| {
++                Ok(handler(signal, info, context))
++            })));
++    }
++
++    #[cfg(has_native_signals)]
++    unsafe fn set_signal_handler_with_trap<H>(&mut self, handler: H) -> crate::Result<()>
++    where
++        H: 'static
++            + Fn(
++                libc::c_int,
++                *const libc::siginfo_t,
++                *const libc::c_void,
++            ) -> core::result::Result<bool, crate::Trap>
++            + Send
++            + Sync,
++    {
++        self.as_context_mut()
++            .0
++            .set_signal_handler_with_trap(Box::new(handler))
++    }
++
++    #[cfg(has_native_signals)]
++    unsafe fn set_memory_write_handler<H>(&mut self, handler: H)
++    where
++        H: 'static + Fn(usize, usize) -> bool + Send + Sync,
++    {
++        self.as_context_mut()
++            .0
++            .set_memory_write_handler(Box::new(handler));
++    }
++
++    #[cfg(has_native_signals)]
++    unsafe fn set_memory_grow_handler<H>(&mut self, handler: H)
++    where
++        H: 'static + Fn(usize, usize, usize) -> bool + Send + Sync,
++    {
++        self.as_context_mut().0.memory_grow_handler = Some(alloc::sync::Arc::new(handler));
+     }
+ }
+diff --git a/crates/wasmtime/src/runtime/vm/component.rs b/crates/wasmtime/src/runtime/vm/component.rs
+index e1599ae34f7221f98f95afec07cb003fea28499b..76079e5e6d67975dd2d6120bd9a24ec6a22ebe79 100644
+--- a/crates/wasmtime/src/runtime/vm/component.rs
++++ b/crates/wasmtime/src/runtime/vm/component.rs
+@@ -267,7 +267,7 @@ impl ComponentInstance {
+         let store = unsafe { &mut *reference.store.0.as_ptr() };
+ 
+         let instance = Instance::from_wasmtime(store, reference.id);
+-        catch_unwind_and_record_trap(store, |store| f(store, instance))
++        catch_unwind_and_record_trap(store, true, |store| f(store, instance))
+     }
+ 
+     /// Returns the `InstanceId` associated with the `vmctx` provided.
+diff --git a/crates/wasmtime/src/runtime/vm/debug_builtins.rs b/crates/wasmtime/src/runtime/vm/debug_builtins.rs
+index 0d18ff4fb737a54b0358c410a1ff042af85a10f1..52315927d542510926049da8e50aac8a3deb4767 100644
+--- a/crates/wasmtime/src/runtime/vm/debug_builtins.rs
++++ b/crates/wasmtime/src/runtime/vm/debug_builtins.rs
+@@ -18,7 +18,7 @@ pub unsafe extern "C" fn resolve_vmctx_memory_ptr(p: *const u32) -> *const u8 {
+             VMCTX_AND_MEMORY.0 != NonNull::dangling(),
+             "must call `__vmctx->set()` before resolving Wasm pointers"
+         );
+-        Instance::enter_host_from_wasm(VMCTX_AND_MEMORY.0, |store, instance| {
++        Instance::enter_host_from_wasm(VMCTX_AND_MEMORY.0, true, |store, instance| {
+             let handle = store.instance_mut(instance);
+             assert!(
+                 VMCTX_AND_MEMORY.1 < handle.env_module().memories.len(),
+diff --git a/crates/wasmtime/src/runtime/vm/instance.rs b/crates/wasmtime/src/runtime/vm/instance.rs
+index 5be8d457ec7409646901d18ed948eafeaa9b1e82..ee19bdd61edb9b6b84b79be058f9e638d9dd5049 100644
+--- a/crates/wasmtime/src/runtime/vm/instance.rs
++++ b/crates/wasmtime/src/runtime/vm/instance.rs
+@@ -319,6 +319,7 @@ impl Instance {
+     #[inline]
+     pub(crate) unsafe fn enter_host_from_wasm<R>(
+         vmctx: NonNull<VMContext>,
++        call_hooks: bool,
+         f: impl FnOnce(&mut dyn VMStore, InstanceId) -> R,
+     ) -> R::Abi
+     where
+@@ -337,7 +338,7 @@ impl Instance {
+ 
+         // Thread the `store` and `instance` through panic/trap infrastructure
+         // back into `f`.
+-        catch_unwind_and_record_trap(store, |store| f(store, instance))
++        catch_unwind_and_record_trap(store, call_hooks, |store| f(store, instance))
+     }
+ 
+     /// Converts the provided `*mut VMContext` to an `Instance` pointer and
+@@ -776,13 +777,14 @@ impl Instance {
+         limiter: Option<&mut StoreResourceLimiter<'_>>,
+         idx: DefinedMemoryIndex,
+         delta: u64,
++        grow_handler: Option<&crate::runtime::store::MemoryGrowHandler>,
+     ) -> Result<Option<usize>, Error> {
+         let memory = &mut self.as_mut().memories_mut()[idx].1;
+ 
+         // SAFETY: this is the safe wrapper around `Memory::grow` because it
+         // automatically updates the `VMMemoryDefinition` in this instance after
+         // a growth operation below.
+-        let result = unsafe { memory.grow(delta, limiter).await };
++        let result = unsafe { memory.grow(delta, limiter, grow_handler).await };
+ 
+         // Update the state used by a non-shared Wasm memory in case the base
+         // pointer and/or the length changed.
+diff --git a/crates/wasmtime/src/runtime/vm/instance/allocator/pooling.rs b/crates/wasmtime/src/runtime/vm/instance/allocator/pooling.rs
+index 74ca072056df3040affe7ca1f6346628a203f909..42c6150adbf44eda720290f899af0d6f7f153a8b 100644
+--- a/crates/wasmtime/src/runtime/vm/instance/allocator/pooling.rs
++++ b/crates/wasmtime/src/runtime/vm/instance/allocator/pooling.rs
+@@ -629,7 +629,7 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
+         request: &'a mut InstanceAllocationRequest<'b, 'c>,
+         ty: &'a wasmtime_environ::Memory,
+         memory_index: Option<DefinedMemoryIndex>,
+-        _memory_kind: MemoryKind,
++        memory_kind: MemoryKind,
+     ) -> Pin<Box<dyn Future<Output = Result<(MemoryAllocationIndex, Memory)>> + Send + 'a>> {
+         crate::runtime::box_future(async move {
+             async {
+@@ -637,7 +637,11 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
+                 // `with_flush_and_retry` but adapted for async closures instead of only
+                 // sync closures. Right now that won't compile though so this is the
+                 // manually expanded version of the method.
+-                let mut e = match self.memories.allocate(request, ty, memory_index).await {
++                let mut e = match self
++                    .memories
++                    .allocate(request, ty, memory_index, memory_kind)
++                    .await
++                {
+                     Ok(result) => return Ok(result),
+                     Err(e) => e,
+                 };
+@@ -648,7 +652,11 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
+                     }
+                     let queue = self.decommit_queue(shard).lock().unwrap();
+                     if self.flush_decommit_queue(queue) {
+-                        match self.memories.allocate(request, ty, memory_index).await {
++                        match self
++                            .memories
++                            .allocate(request, ty, memory_index, memory_kind)
++                            .await
++                        {
+                             Ok(result) => return Ok(result),
+                             Err(err) => e = err,
+                         }
+diff --git a/crates/wasmtime/src/runtime/vm/instance/allocator/pooling/memory_pool.rs b/crates/wasmtime/src/runtime/vm/instance/allocator/pooling/memory_pool.rs
+index 5a554d72cd7a5cb0daae145d0c03419a5d0f1717..737d0b5b451d407d943cc9f2a3553a91417a8bcb 100644
+--- a/crates/wasmtime/src/runtime/vm/instance/allocator/pooling/memory_pool.rs
++++ b/crates/wasmtime/src/runtime/vm/instance/allocator/pooling/memory_pool.rs
+@@ -356,8 +356,12 @@ impl MemoryPool {
+         request: &mut InstanceAllocationRequest<'_, '_>,
+         ty: &wasmtime_environ::Memory,
+         memory_index: Option<DefinedMemoryIndex>,
++        memory_kind: MemoryKind,
+     ) -> Result<(MemoryAllocationIndex, Memory)> {
+         let tunables = request.store.engine().tunables();
++        // Both allocation kinds use this pool's linear-memory layout. Preserve
++        // the actual kind separately for limiter callbacks, without changing
++        // the reservation or guard assumptions of the preallocated slots.
+         let memory_tunables = MemoryTunables::new(tunables, MemoryKind::LinearMemory);
+         let stripe_index = if let Some(pkey) = request.store.get_pkey() {
+             pkey.as_stripe()
+@@ -435,6 +439,7 @@ impl MemoryPool {
+             base_capacity.byte_count(),
+             slot,
+             request.limiter.as_deref_mut(),
++            memory_kind,
+         )
+         .await?;
+         guard.active = false;
+diff --git a/crates/wasmtime/src/runtime/vm/interpreter.rs b/crates/wasmtime/src/runtime/vm/interpreter.rs
+index a32c26bb1c4d04430dab533fac00e5daff29065a..b8ddf780fcd7597b847bf60ed5540a52e656ddba 100644
+--- a/crates/wasmtime/src/runtime/vm/interpreter.rs
++++ b/crates/wasmtime/src/runtime/vm/interpreter.rs
+@@ -475,7 +475,7 @@ impl InterpreterRef<'_> {
+                     s.entry_trap_handler()
+                 }
+                 None => {
+-                    match s.test_if_trap(regs, None, |_| false) {
++                    match s.test_if_trap(regs, None, |_| Ok(false)) {
+                         // This shouldn't be possible, so this is a fatal error
+                         // if it happens.
+                         TrapTest::NotWasm => {
+diff --git a/crates/wasmtime/src/runtime/vm/libcalls.rs b/crates/wasmtime/src/runtime/vm/libcalls.rs
+index cc234ec1a499cd32547a6792ac4e88bc1fc8cfea..9ed90bf8df773b742af17fb3369d0347423bd519 100644
+--- a/crates/wasmtime/src/runtime/vm/libcalls.rs
++++ b/crates/wasmtime/src/runtime/vm/libcalls.rs
+@@ -10,12 +10,11 @@
+ //! * They must only contain basic, raw i32/i64/f32/f64/pointer parameters that
+ //!   are safe to pass across the system ABI.
+ //!
+-//! * If any nested function propagates an `Err(trap)` out to the library
+-//!   function frame, we need to raise it. This involves some nasty and quite
+-//!   unsafe code under the covers! Notably, after raising the trap, drops
+-//!   **will not** be run for local variables! This can lead to things like
+-//!   leaking `InstanceHandle`s which leads to never deallocating JIT code,
+-//!   instances, and modules if we are not careful!
++//! * Fallible libcalls return through ordinary Rust frames, running their
++//!   destructors. The wrapper records the error or panic and returns a sentinel;
++//!   the generated trampoline then raises the trap after Rust has returned.
++//!   Never raise a signal-based trap from a native write: that would skip these
++//!   destructors.
+ //!
+ //! * The libcall must be entered via a Wasm-to-libcall trampoline that saves
+ //!   the last Wasm FP and PC for stack walking purposes. (For more details, see
+@@ -122,7 +121,7 @@ pub mod raw {
+                 ) $(-> libcall!(@ty $result))? {
+                     $(#[cfg($attr)])?
+                     unsafe {
+-                        Instance::enter_host_from_wasm(vmctx, |store, instance| {
++                        Instance::enter_host_from_wasm(vmctx, libcall!(@call_hooks $name), |store, instance| {
+                             super::$name(store, instance, $($pname),*)
+                         })
+                     }
+@@ -149,6 +148,13 @@ pub mod raw {
+             )*
+         };
+ 
++        // These operations already carry bounds-checked raw pointers. General
++        // call hooks may grow memory or move GC objects before those pointers
++        // are used. The write handler has an explicit no-reentry contract.
++        (@call_hooks memory_copy) => (false);
++        (@call_hooks memory_fill) => (false);
++        (@call_hooks $name:ident) => (true);
++
+         (@ty u32) => (u32);
+         (@ty u64) => (u64);
+         (@ty f32) => (f32);
+@@ -254,12 +260,13 @@ fn memory_grow(
+     let (mut limiter, store) = store.resource_limiter_and_store_opaque();
+     let limiter = limiter.as_mut();
+     block_on!(store, async |store, _| {
++        let grow_handler = store.memory_grow_handler.clone();
+         let instance = store.instance_mut(instance);
+         let module = instance.env_module();
+         let page_size_log2 = module.memories[module.memory_index(memory_index)].page_size_log2;
+ 
+         let result = instance
+-            .memory_grow(limiter, memory_index, delta)
++            .memory_grow(limiter, memory_index, delta, grow_handler.as_deref())
+             .await?
+             .map(|size_in_bytes| AllocationSize(size_in_bytes >> page_size_log2));
+ 
+@@ -363,25 +370,30 @@ fn passive_elem_segment_drop(
+ 
+ // Implementation of `memory.copy`.
+ unsafe fn memory_copy(
+-    _store: &mut dyn VMStore,
++    store: &mut dyn VMStore,
+     _instance: InstanceId,
+     dst: *mut u8,
+     src: *mut u8,
+     len: usize,
+-) {
++) -> Result<()> {
++    // Bounds were checked by generated code. Permission must be obtained before
++    // entering a native copy: a denied fault cannot unwind arbitrary Rust frames.
++    store.prepare_memory_write(dst, len)?;
+     let src = src.cast_const();
+     // FIXME(#4203): this is known to not be sound in the presence of shared
+     // memories.
+     unsafe { src.copy_to(dst, len) }
++    Ok(())
+ }
+ 
+ unsafe fn memory_fill(
+-    _store: &mut dyn VMStore,
++    store: &mut dyn VMStore,
+     _instance: InstanceId,
+     dst: *mut u8,
+     val: u32,
+     len: usize,
+-) {
++) -> Result<()> {
++    store.prepare_memory_write(dst, len)?;
+     // FIXME(#4203): this is known to not be sound in the presence of shared
+     // memories.
+     unsafe {
+@@ -392,6 +404,7 @@ unsafe fn memory_fill(
+         )]
+         dst.write_bytes(val as u8, len);
+     }
++    Ok(())
+ }
+ 
+ // Implementation of `ref.func`.
+diff --git a/crates/wasmtime/src/runtime/vm/memory.rs b/crates/wasmtime/src/runtime/vm/memory.rs
+index ef68214ed7450ac43a693e38c35855b7d858018a..4c22f264b01ae4ac4acfd7a55be0c526330e023b 100644
+--- a/crates/wasmtime/src/runtime/vm/memory.rs
++++ b/crates/wasmtime/src/runtime/vm/memory.rs
+@@ -76,7 +76,7 @@
+ 
+ use crate::Engine;
+ use crate::prelude::*;
+-use crate::runtime::store::StoreResourceLimiter;
++use crate::runtime::store::{MemoryGrowHandler, StoreResourceLimiter};
+ use crate::runtime::vm::vmcontext::VMMemoryDefinition;
+ #[cfg(has_virtual_memory)]
+ use crate::runtime::vm::{HostAlignedByteCount, MmapOffset};
+@@ -246,12 +246,12 @@ impl Memory {
+         limiter: Option<&mut StoreResourceLimiter<'_>>,
+         kind: MemoryKind,
+     ) -> Result<Self> {
+-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
++        let (minimum, maximum) = Self::limit_new(ty, limiter, kind).await?;
+         let tunables = engine.tunables();
+         let memory_tunables = MemoryTunables::new(tunables, kind);
+         let allocation = creator.new_memory(ty, &memory_tunables, minimum, maximum)?;
+ 
+-        let memory = LocalMemory::new(ty, &memory_tunables, allocation, memory_image)?;
++        let memory = LocalMemory::new(ty, &memory_tunables, allocation, memory_image, kind)?;
+         Ok(if ty.shared {
+             Memory::Shared(SharedMemory::wrap(engine, ty, memory)?)
+         } else {
+@@ -268,8 +268,9 @@ impl Memory {
+         base_capacity: usize,
+         memory_image: MemoryImageSlot,
+         limiter: Option<&mut StoreResourceLimiter<'_>>,
++        kind: MemoryKind,
+     ) -> Result<Self> {
+-        let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
++        let (minimum, maximum) = Self::limit_new(ty, limiter, kind).await?;
+         let pooled_memory = StaticMemory::new(base, base_capacity, minimum, maximum)?;
+         let allocation = try_new::<Box<_>>(pooled_memory)?;
+ 
+@@ -277,7 +278,7 @@ impl Memory {
+         // `LocalMemory` structure created, notably we already have
+         // `memory_image` and regardless of configuration settings this memory
+         // can't move its base pointer since it's a fixed allocation.
+-        let mut memory = LocalMemory::new(ty, memory_tunables, allocation, None)?;
++        let mut memory = LocalMemory::new(ty, memory_tunables, allocation, None, kind)?;
+         assert!(memory.memory_image.is_none());
+         memory.memory_image = Some(memory_image);
+         memory.memory_may_move = false;
+@@ -299,6 +300,7 @@ impl Memory {
+     pub(crate) async fn limit_new(
+         ty: &wasmtime_environ::Memory,
+         limiter: Option<&mut StoreResourceLimiter<'_>>,
++        kind: MemoryKind,
+     ) -> Result<(usize, Option<usize>)> {
+         let page_size = usize::try_from(ty.page_size()).unwrap();
+ 
+@@ -343,7 +345,7 @@ impl Memory {
+         // now the expected uses of limiter means that's ok.
+         if let Some(limiter) = limiter {
+             if !limiter
+-                .memory_growing(0, minimum.unwrap_or(absolute_max), maximum)
++                .memory_growing(0, minimum.unwrap_or(absolute_max), maximum, kind)
+                 .await?
+             {
+                 bail!(
+@@ -416,9 +418,10 @@ impl Memory {
+         &mut self,
+         delta_pages: u64,
+         limiter: Option<&mut StoreResourceLimiter<'_>>,
++        grow_handler: Option<&MemoryGrowHandler>,
+     ) -> Result<Option<usize>, Error> {
+         let result = match self {
+-            Memory::Local(mem) => mem.grow(delta_pages, limiter).await?,
++            Memory::Local(mem) => mem.grow(delta_pages, limiter, grow_handler).await?,
+             Memory::Shared(mem) => mem.grow(delta_pages)?,
+         };
+         match result {
+@@ -536,6 +539,7 @@ impl Memory {
+ pub struct LocalMemory {
+     alloc: Box<dyn RuntimeLinearMemory>,
+     ty: wasmtime_environ::Memory,
++    kind: MemoryKind,
+     memory_may_move: bool,
+     memory_guard_size: usize,
+     memory_reservation: usize,
+@@ -551,6 +555,7 @@ impl LocalMemory {
+         memory_tunables: &MemoryTunables<'_>,
+         alloc: Box<dyn RuntimeLinearMemory>,
+         memory_image: Option<&Arc<MemoryImage>>,
++        kind: MemoryKind,
+     ) -> Result<LocalMemory> {
+         // If a memory image was specified, try to create the MemoryImageSlot on
+         // top of our mmap.
+@@ -586,6 +591,7 @@ impl LocalMemory {
+         };
+         Ok(LocalMemory {
+             ty: *ty,
++            kind,
+             alloc,
+             memory_may_move: ty.memory_may_move(memory_tunables),
+             memory_image,
+@@ -608,6 +614,7 @@ impl LocalMemory {
+         &mut self,
+         delta_pages: u64,
+         mut limiter: Option<&mut StoreResourceLimiter<'_>>,
++        grow_handler: Option<&MemoryGrowHandler>,
+     ) -> Result<Option<(usize, usize)>, Error> {
+         let old_byte_size = self.alloc.byte_size();
+ 
+@@ -651,7 +658,7 @@ impl LocalMemory {
+         // Store limiter gets first chance to reject memory_growing.
+         if let Some(limiter) = &mut limiter {
+             if !limiter
+-                .memory_growing(old_byte_size, new_byte_size, maximum)
++                .memory_growing(old_byte_size, new_byte_size, maximum, self.kind)
+                 .await?
+             {
+                 return Ok(None);
+@@ -663,46 +670,46 @@ impl LocalMemory {
+         let base_ptr_before = self.alloc.base().as_mut_ptr();
+         let required_to_not_move_memory = new_byte_size <= self.alloc.byte_capacity();
+ 
+-        let result = (|| -> Result<()> {
+-            // Never exceed maximum, even if limiter permitted it.
+-            if let Some(max) = maximum {
+-                if new_byte_size > max {
+-                    bail!("Memory maximum size exceeded");
+-                }
+-            }
+-
+-            // If memory isn't allowed to move then don't let growth happen
+-            // beyond the initial capacity
+-            if !self.memory_may_move && new_byte_size > self.alloc.byte_capacity() {
+-                bail!("Memory maximum size exceeded");
++        // Preserve type and reservation limits even if the Store limiter
++        // accepted growth. The private-exposure hook runs only after these.
++        let result = if maximum.is_some_and(|max| new_byte_size > max)
++            || (!self.memory_may_move && new_byte_size > self.alloc.byte_capacity())
++        {
++            Err(crate::format_err!("Memory maximum size exceeded"))
++        } else {
++            // Unlike the generic resource limiter, this hook identifies the
++            // linear allocation. Reserve private-page exposure before either
++            // the image overlay or the allocator makes the tail writable.
++            if grow_handler.is_some_and(|handler| {
++                !handler(base_ptr_before as usize, old_byte_size, new_byte_size)
++            }) {
++                return Err(wasmtime_environ::Trap::AllocationTooLarge.into());
+             }
+ 
+             // If we have a CoW image overlay then let it manage accessible
+             // bytes. Once the heap limit is modified inform the underlying
+             // allocation that the size has changed.
+             //
+-            // If the growth is going beyond the size of the heap image then
+-            // discard it. This should only happen for `MmapMemory` where
+-            // `no_clear_on_drop` is set so the destructor doesn't do anything.
+-            // For now be maximally sure about this by asserting that memory can
+-            // indeed move and that we're on unix. If this wants to run
+-            // somewhere else like Windows or with other allocations this may
+-            // need adjusting.
+-            if let Some(image) = &mut self.memory_image {
+-                if new_byte_size <= self.alloc.byte_capacity() {
+-                    image.set_heap_limit(new_byte_size)?;
+-                    self.alloc.set_byte_size(new_byte_size);
+-                    return Ok(());
++            // Growth beyond the reserved allocation discards image bookkeeping
++            // before relocating. Dropping an on-demand image slot does not
++            // reset its mapping, so the allocator can still copy the old bytes.
++            (|| -> Result<()> {
++                if let Some(image) = &mut self.memory_image {
++                    if new_byte_size <= self.alloc.byte_capacity() {
++                        image.set_heap_limit(new_byte_size)?;
++                        self.alloc.set_byte_size(new_byte_size);
++                        return Ok(());
++                    }
++                    assert!(cfg!(unix));
++                    assert!(self.memory_may_move);
++                    self.memory_image = None;
+                 }
+-                assert!(cfg!(unix));
+-                assert!(self.memory_may_move);
+-                self.memory_image = None;
+-            }
+ 
+-            // And failing all that fall back to the underlying allocation to
+-            // grow it.
+-            self.alloc.grow_to(new_byte_size)
+-        })();
++                // And failing all that fall back to the underlying allocation to
++                // grow it.
++                self.alloc.grow_to(new_byte_size)
++            })()
++        };
+ 
+         match result {
+             Ok(()) => {
+diff --git a/crates/wasmtime/src/runtime/vm/memory/shared_memory.rs b/crates/wasmtime/src/runtime/vm/memory/shared_memory.rs
+index 9f0721be11f02bb93bbfc7f2fc6ada6f6e88bd98..59da0672283d13088401e9b7bdfa2d4a4fdea97b 100644
+--- a/crates/wasmtime/src/runtime/vm/memory/shared_memory.rs
++++ b/crates/wasmtime/src/runtime/vm/memory/shared_memory.rs
+@@ -39,14 +39,24 @@ impl SharedMemory {
+         );
+         // Note that without a limiter being passed to `limit_new` this
+         // `assert_ready` should never panic.
+-        let (minimum_bytes, maximum_bytes) = vm::assert_ready(Memory::limit_new(ty, None))?;
++        let (minimum_bytes, maximum_bytes) = vm::assert_ready(Memory::limit_new(
++            ty,
++            None,
++            wasmtime_environ::MemoryKind::LinearMemory,
++        ))?;
+         let mmap_memory = MmapMemory::new(ty, &memory_tunables, minimum_bytes, maximum_bytes)?;
+         let boxed: Box<dyn crate::runtime::vm::RuntimeLinearMemory> =
+             try_new::<Box<_>>(mmap_memory)?;
+         Self::wrap(
+             engine,
+             ty,
+-            LocalMemory::new(ty, &memory_tunables, boxed, None)?,
++            LocalMemory::new(
++                ty,
++                &memory_tunables,
++                boxed,
++                None,
++                wasmtime_environ::MemoryKind::LinearMemory,
++            )?,
+         )
+     }
+ 
+@@ -92,7 +102,7 @@ impl SharedMemory {
+         let mut memory = self.0.memory.write().unwrap();
+         // Without a limiter being passed in this shouldn't have an await point,
+         // so it should be safe to assert that it's ready.
+-        let result = vm::assert_ready(memory.grow(delta_pages, None))?;
++        let result = vm::assert_ready(memory.grow(delta_pages, None, None))?;
+         if let Some((_old_size_in_bytes, new_size_in_bytes)) = result {
+             // Store the new size to the `VMMemoryDefinition` for JIT-generated
+             // code (and runtime functions) to access. No other code can be
+diff --git a/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs b/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs
+index 4f80189a915a11f73aaf73e2f4654e17c39d4cc2..441a18cdf9a93ec4dace69e18113df9895281f43 100644
+--- a/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs
++++ b/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs
+@@ -9,8 +9,15 @@ use std::ptr::{self, null_mut};
+ use wasmtime_unwinder::Handler;
+ 
+ /// Function which may handle custom signals while processing traps.
+-pub type SignalHandler =
+-    Box<dyn Fn(libc::c_int, *const libc::siginfo_t, *const libc::c_void) -> bool + Send + Sync>;
++pub type SignalHandler = Box<
++    dyn Fn(
++            libc::c_int,
++            *const libc::siginfo_t,
++            *const libc::c_void,
++        ) -> core::result::Result<bool, crate::Trap>
++        + Send
++        + Sync,
++>;
+ 
+ const UNINIT_SIGACTION: libc::sigaction = unsafe { mem::zeroed() };
+ static mut PREV_SIGSEGV: libc::sigaction = UNINIT_SIGACTION;
+diff --git a/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs b/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs
+index 69438ea91fae26f1c7ddcc366e50e2a093d9c421..f47f3bc6dc6c0ca9bab79f71e7bf251326ba1bff 100644
+--- a/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs
++++ b/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs
+@@ -233,7 +233,7 @@ unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINT
+         } else {
+             None
+         };
+-        match info.test_if_trap(regs, faulting_addr, |handler| handler(exception_info)) {
++        match info.test_if_trap(regs, faulting_addr, |handler| Ok(handler(exception_info))) {
+             TrapTest::NotWasm => EXCEPTION_CONTINUE_SEARCH,
+             TrapTest::HandledByEmbedder => EXCEPTION_CONTINUE_EXECUTION,
+             TrapTest::Trap(handler) => {
+diff --git a/crates/wasmtime/src/runtime/vm/traphandlers.rs b/crates/wasmtime/src/runtime/vm/traphandlers.rs
+index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9eee9c12054 100644
+--- a/crates/wasmtime/src/runtime/vm/traphandlers.rs
++++ b/crates/wasmtime/src/runtime/vm/traphandlers.rs
+@@ -121,9 +121,11 @@ pub(super) unsafe fn raise_preexisting_trap(store: &mut dyn VMStore) {
+ /// This is primarily used in conjunction with the Cranelift-and-host boundary.
+ /// This function acts as a bridge between the two to appropriately handle
+ /// encoding host values to Cranelift-understood ABIs via the `HostResult`
+-/// trait.
++/// trait. `call_hooks` must be false for operations carrying raw guest-memory
++/// pointers: general call hooks can reenter the Store and invalidate them.
+ pub fn catch_unwind_and_record_trap<R>(
+     store: &mut dyn VMStore,
++    call_hooks: bool,
+     f: impl FnOnce(&mut dyn VMStore) -> R,
+ ) -> R::Abi
+ where
+@@ -133,7 +135,7 @@ where
+     // return value is always provided and if unwind information is provided
+     // (e.g. `ret` is a "false"-y value) then it's recorded in TLS for the
+     // unwind operation that's about to happen from Cranelift-generated code.
+-    let (ret, unwind) = R::maybe_catch_unwind(store, |store| f(store));
++    let (ret, unwind) = R::maybe_catch_unwind(store, call_hooks, |store| f(store));
+     if let Some(unwind) = unwind {
+         tls::with(|info| info.unwrap().record_unwind(unwind));
+     }
+@@ -169,6 +171,7 @@ pub trait HostResult {
+     /// and initiate an unwind (currently through `raise_preexisting_trap`).
+     fn maybe_catch_unwind(
+         store: &mut dyn VMStore,
++        call_hooks: bool,
+         f: impl FnOnce(&mut dyn VMStore) -> Self,
+     ) -> (Self::Abi, Option<UnwindReason>);
+ }
+@@ -186,6 +189,7 @@ macro_rules! host_result_no_catch {
+                 #[allow(unreachable_code, reason = "some types uninhabited on some platforms")]
+                 fn maybe_catch_unwind(
+                     store: &mut dyn VMStore,
++                    _call_hooks: bool,
+                     f: impl FnOnce(&mut dyn VMStore) -> $t,
+                 ) -> ($t, Option<UnwindReason>) {
+                     (f(store), None)
+@@ -213,6 +217,7 @@ impl HostResult for NonNull<u8> {
+     type Abi = *mut u8;
+     fn maybe_catch_unwind(
+         store: &mut dyn VMStore,
++        _call_hooks: bool,
+         f: impl FnOnce(&mut dyn VMStore) -> Self,
+     ) -> (*mut u8, Option<UnwindReason>) {
+         (f(store).as_ptr(), None)
+@@ -243,8 +248,12 @@ where
+ 
+     fn maybe_catch_unwind(
+         store: &mut dyn VMStore,
++        call_hooks: bool,
+         f: impl FnOnce(&mut dyn VMStore) -> Result<T, E>,
+     ) -> (T::Abi, Option<UnwindReason>) {
++        #[cfg(not(feature = "call-hook"))]
++        let _ = call_hooks;
++
+         // First wrap `f` in call hooks if that feature is enabled. This is used
+         // as a "pretty far down in the stack" mechanism of ensuring that hooks
+         // aren't forgotten.
+@@ -255,23 +264,26 @@ where
+         // * host functions
+         // * component versions of the above
+         //
+-        // This specifically is NOT handling libcalls where the result can't
+-        // carry a result. This should be safe as anything which doesn't return
+-        // a `Result` sort of has to be simple enough to not allow recursion so
+-        // it's just a brief exit from the guest to the host.
++        // Infallible libcalls do not run these hooks. Raw-pointer bulk libcalls
++        // also opt out: they must catch errors and panics without letting a
++        // general hook invalidate their already-computed pointers.
+         //
+         // Also note that this only happens with the `call-hook` feature because
+         // this otherwise imposes a dynamic dispatch on the `store` trait object
+         // which otherwise can't be optimized away.
+         #[cfg(feature = "call-hook")]
+         let f = move |store: &mut dyn VMStore| {
+-            store.call_hook(crate::CallHook::CallingHost)?;
++            if call_hooks {
++                store.call_hook(crate::CallHook::CallingHost)?;
++            }
+ 
+             let res = f(store);
+ 
+             // Note that if this returns a trap then `ret` is discarded
+             // entirely.
+-            store.call_hook(crate::CallHook::ReturningFromHost)?;
++            if call_hooks {
++                store.call_hook(crate::CallHook::ReturningFromHost)?;
++            }
+ 
+             res.map_err(|e| e.into())
+         };
+@@ -514,6 +526,10 @@ mod call_thread_state {
+         pub(super) unwind: Cell<Option<UnwindReason>>,
+         #[cfg(all(has_native_signals))]
+         pub(super) signal_handler: Option<*const SignalHandler>,
++        #[cfg(all(feature = "std", has_native_signals, unix))]
++        pub(super) signal_code_ranges: Option<crate::module::SignalCodeRanges>,
++        #[cfg(all(feature = "std", has_native_signals, unix))]
++        pub(super) pending_signal_trap: Cell<Option<(usize, wasmtime_environ::Trap)>>,
+         pub(super) capture_backtrace: bool,
+         #[cfg(feature = "coredump")]
+         pub(super) capture_coredump: bool,
+@@ -539,6 +555,8 @@ mod call_thread_state {
+             // Unwind information should not be present as it should have
+             // already been processed.
+             debug_assert!(self.unwind.replace(None).is_none());
++            #[cfg(all(feature = "std", has_native_signals, unix))]
++            debug_assert!(self.pending_signal_trap.get().is_none());
+         }
+     }
+ 
+@@ -553,6 +571,10 @@ mod call_thread_state {
+                 unwinder: store.unwinder(),
+                 #[cfg(all(has_native_signals))]
+                 signal_handler: store.signal_handler(),
++                #[cfg(all(feature = "std", has_native_signals, unix))]
++                signal_code_ranges: store.modules().signal_code_ranges(),
++                #[cfg(all(feature = "std", has_native_signals, unix))]
++                pending_signal_trap: Cell::new(None),
+                 capture_backtrace: store.engine().config().wasm_backtrace_max_frames.is_some(),
+                 #[cfg(feature = "coredump")]
+                 capture_coredump: store.engine().config().coredump_on_trap,
+@@ -723,6 +745,18 @@ impl CallThreadState {
+ 
+     #[cold]
+     fn read_unwind(&self) -> UnwindReason {
++        #[cfg(all(feature = "std", has_native_signals, unix))]
++        if let Some((pc, trap)) = self.pending_signal_trap.take() {
++            // The signal has returned and no guest frames are live here. Only
++            // now is it safe to allocate the ordinary trap payload. Walking the
++            // discarded frames for a backtrace would no longer be safe.
++            debug_assert!(self.unwind.replace(None).is_none());
++            return UnwindReason::from(TrapReason::Jit {
++                pc,
++                faulting_addr: None,
++                trap: trap.into(),
++            });
++        }
+         self.unwind.replace(None).unwrap()
+     }
+ 
+@@ -977,34 +1011,58 @@ impl CallThreadState {
+         &self,
+         regs: TrapRegisters,
+         faulting_addr: Option<usize>,
+-        call_handler: impl FnOnce(&SignalHandler) -> bool,
++        call_handler: impl FnOnce(&SignalHandler) -> core::result::Result<bool, wasmtime_environ::Trap>,
+     ) -> TrapTest {
+         // First up see if any instance registered has a custom trap handler,
+         // in which case run them all. If anything handles the trap then we
+         // return that the trap was handled.
+         let _ = &call_handler;
+         #[cfg(all(has_native_signals, not(miri)))]
+-        if let Some(handler) = self.signal_handler {
+-            if unsafe { call_handler(&*handler) } {
+-                return TrapTest::HandledByEmbedder;
++        let requested_trap = match self.signal_handler {
++            Some(handler) => match unsafe { call_handler(&*handler) } {
++                Ok(true) => return TrapTest::HandledByEmbedder,
++                Ok(false) => None,
++                Err(trap) => Some(trap),
++            },
++            None => None,
++        };
++        #[cfg(not(all(has_native_signals, not(miri))))]
++        let requested_trap: Option<wasmtime_environ::Trap> = None;
++
++        if let Some(trap) = requested_trap {
++            #[cfg(all(feature = "std", has_native_signals, unix))]
++            {
++                let Some(pointer) = &self.signal_code_ranges else {
++                    return TrapTest::NotWasm;
++                };
++                // The Store publishes immutable ranges on module registration.
++                // Only this thread can replace them; a signal interrupts that
++                // replacement and finishes before the old ranges can be freed.
++                let ranges = unsafe { &*pointer.load(core::sync::atomic::Ordering::Acquire) };
++                let index = ranges.partition_point(|range| range.end <= regs.pc);
++                if !ranges.get(index).is_some_and(|range| range.contains(&regs.pc)) {
++                    return TrapTest::NotWasm;
++                }
++                // Do not use lookup_code or set_jit_trap here: they lock the
++                // global code registry and allocate a trap/backtrace. Native
++                // faults are delegated without unwinding any Rust frames.
++                self.pending_signal_trap.set(Some((regs.pc, trap)));
++                return TrapTest::Trap(self.entry_trap_handler());
++            }
++            #[cfg(not(all(feature = "std", has_native_signals, unix)))]
++            {
++                let _ = trap;
++                unreachable!("this platform has no trapping signal callback");
+             }
+         }
+ 
+-        // If this fault wasn't in wasm code, then it's not our problem
++        // Ordinary faults retain the existing trap-annotation requirement.
+         let Some((code, text_offset)) = lookup_code(regs.pc) else {
+             return TrapTest::NotWasm;
+         };
+-
+-        // If the fault was at a location that was not marked as potentially
+-        // trapping, then that's a bug in Cranelift/Winch/etc. Don't try to
+-        // catch the trap and pretend this isn't wasm so the program likely
+-        // aborts.
+         let Some(trap) = code.lookup_trap_code(text_offset) else {
+             return TrapTest::NotWasm;
+         };
+-
+-        // If all that passed then this is indeed a wasm trap, so return the
+-        // `Handler` setup in the original wasm frame.
+         self.set_jit_trap(regs, faulting_addr, trap);
+         let entry_handler = self.entry_trap_handler();
+         TrapTest::Trap(entry_handler)
+diff --git a/tests/all/limits.rs b/tests/all/limits.rs
+index 1e75a38d12576feaa9d5a950ab4516e0a35f55a7..75399dba0636a11390f0f87f2153d152f105c014 100644
+--- a/tests/all/limits.rs
++++ b/tests/all/limits.rs
+@@ -2,6 +2,189 @@ use wasmtime::*;
+ 
+ const WASM_PAGE_SIZE: usize = wasmtime_environ::Memory::DEFAULT_PAGE_SIZE as usize;
+ 
++#[derive(Default)]
++struct SeparateGcLimiter {
++    linear: Vec<(usize, usize)>,
++    gc: Vec<(usize, usize)>,
++    deny_gc: bool,
++}
++
++impl ResourceLimiter for SeparateGcLimiter {
++    fn memory_growing(&mut self, current: usize, desired: usize, _: Option<usize>) -> Result<bool> {
++        self.linear.push((current, desired));
++        Ok(true)
++    }
++
++    fn gc_heap_growing(
++        &mut self,
++        current: usize,
++        desired: usize,
++        _: Option<usize>,
++    ) -> Result<bool> {
++        self.gc.push((current, desired));
++        Ok(!self.deny_gc)
++    }
++
++    fn table_growing(&mut self, _: usize, _: usize, _: Option<usize>) -> Result<bool> {
++        Ok(true)
++    }
++}
++
++#[async_trait::async_trait]
++impl ResourceLimiterAsync for SeparateGcLimiter {
++    async fn memory_growing(
++        &mut self,
++        current: usize,
++        desired: usize,
++        maximum: Option<usize>,
++    ) -> Result<bool> {
++        ResourceLimiter::memory_growing(self, current, desired, maximum)
++    }
++
++    async fn gc_heap_growing(
++        &mut self,
++        current: usize,
++        desired: usize,
++        maximum: Option<usize>,
++    ) -> Result<bool> {
++        ResourceLimiter::gc_heap_growing(self, current, desired, maximum)
++    }
++
++    async fn table_growing(&mut self, _: usize, _: usize, _: Option<usize>) -> Result<bool> {
++        Ok(true)
++    }
++}
++
++#[tokio::test]
++#[cfg_attr(miri, ignore)]
++async fn limiter_distinguishes_internal_gc_from_linear_memory() -> Result<()> {
++    for asynchronous in [false, true] {
++        for pooling in [false, true] {
++            let mut config = Config::new();
++            config
++                .async_support(asynchronous)
++                .gc_heap_initial_size(WASM_PAGE_SIZE as u64);
++            if pooling {
++                let mut pool = crate::small_pool_config();
++                pool.max_memory_size(1024 * 1024)
++                    .total_memories(2)
++                    .total_gc_heaps(1);
++                config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
++            }
++            let engine = Engine::new(&config)?;
++            let module = Module::new(
++                &engine,
++                r#"(module
++                (memory (export "memory") 1)
++                (type $a (array i32))
++                (func (export "allocate") (param i32) (result (ref $a))
++                    local.get 0 array.new_default $a))"#,
++            )?;
++            let mut store = Store::new(&engine, SeparateGcLimiter::default());
++            if asynchronous {
++                store.limiter_async(|limits| limits);
++            } else {
++                store.limiter(|limits| limits);
++            }
++            let instance = if asynchronous {
++                Instance::new_async(&mut store, &module, &[]).await?
++            } else {
++                Instance::new(&mut store, &module, &[])?
++            };
++            let memory = instance.get_memory(&mut store, "memory").unwrap();
++            if asynchronous {
++                memory.grow_async(&mut store, 1).await?;
++            } else {
++                memory.grow(&mut store, 1)?;
++            }
++            let allocate =
++                instance.get_typed_func::<u32, Rooted<ArrayRef>>(&mut store, "allocate")?;
++            for length in [1, WASM_PAGE_SIZE as u32] {
++                let array = if asynchronous {
++                    allocate.call_async(&mut store, length).await?
++                } else {
++                    allocate.call(&mut store, length)?
++                };
++                assert_eq!(array.len(&store)?, length);
++            }
++            assert_eq!(
++                store.data().linear,
++                [(0, WASM_PAGE_SIZE), (WASM_PAGE_SIZE, 2 * WASM_PAGE_SIZE)]
++            );
++            assert!(
++                store
++                    .data()
++                    .gc
++                    .iter()
++                    .any(|&(current, desired)| current == 0 && desired > 0)
++            );
++            assert!(
++                store
++                    .data()
++                    .gc
++                    .iter()
++                    .any(|&(current, desired)| current > 0 && desired > current)
++            );
++            store.data_mut().deny_gc = true;
++            let large = (store.gc_heap_capacity() / 4 + WASM_PAGE_SIZE) as u32;
++            let denied = if asynchronous {
++                allocate.call_async(&mut store, large).await
++            } else {
++                allocate.call(&mut store, large)
++            };
++            assert!(denied.is_err());
++            // Rejected GC growth must not change the linear-memory limit path.
++            if asynchronous {
++                memory.grow_async(&mut store, 1).await?;
++            } else {
++                memory.grow(&mut store, 1)?;
++            }
++            assert_eq!(store.data().linear.len(), 3);
++        }
++    }
++    Ok(())
++}
++
++#[tokio::test]
++#[cfg_attr(miri, ignore)]
++async fn existing_limiter_still_receives_internal_gc_growth() -> Result<()> {
++    for asynchronous in [false, true] {
++        let mut config = Config::new();
++        config
++            .async_support(asynchronous)
++            .gc_heap_initial_size(WASM_PAGE_SIZE as u64);
++        let engine = Engine::new(&config)?;
++        let module = Module::new(
++            &engine,
++            r#"(module
++        (type $a (array i32))
++        (func (export "allocate") (param i32) (result (ref $a))
++            local.get 0 array.new_default $a))"#,
++        )?;
++        // Both FailureDetector implementations only override the original
++        // callback. The async version actually yields before accepting growth.
++        let mut store = Store::new(&engine, FailureDetector::default());
++        let instance = if asynchronous {
++            store.limiter_async(|limits| limits);
++            Instance::new_async(&mut store, &module, &[]).await?
++        } else {
++            store.limiter(|limits| limits);
++            Instance::new(&mut store, &module, &[])?
++        };
++        let allocate = instance.get_typed_func::<u32, Rooted<ArrayRef>>(&mut store, "allocate")?;
++        for length in [1, WASM_PAGE_SIZE as u32] {
++            if asynchronous {
++                allocate.call_async(&mut store, length).await?;
++            } else {
++                allocate.call(&mut store, length)?;
++            }
++        }
++        assert!(store.data().memory_current > 0);
++        assert!(store.data().memory_desired > store.data().memory_current);
++    }
++    Ok(())
++}
++
+ #[test]
+ #[cfg_attr(miri, ignore)]
+ fn test_limits() -> Result<()> {
+diff --git a/tests/all/main.rs b/tests/all/main.rs
+index 08b1b2a6395cb53b1b60ab9d951219d0ca693640..3ead258d068c0d70b4e9973fb6de324fe52975c7 100644
+--- a/tests/all/main.rs
++++ b/tests/all/main.rs
+@@ -39,6 +39,7 @@ mod limits;
+ mod linker;
+ mod memory;
+ mod memory_creator;
++mod memory_write_limits;
+ mod metering_polling;
+ mod missing_async;
+ mod module;
+diff --git a/tests/all/memory_write_limits.rs b/tests/all/memory_write_limits.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..1392b32b80f4709e52fb92f8ee700c29a5b6ade2
+--- /dev/null
++++ b/tests/all/memory_write_limits.rs
+@@ -0,0 +1,537 @@
++#![cfg(all(target_os = "linux", target_arch = "x86_64", not(miri)))]
++
++// Exercise real protected-page writes: a missing trap or preflight boundary
++// otherwise terminates the process instead of rejecting one guest execution.
++use object::{Object, ObjectSection};
++use std::sync::{
++    Arc,
++    atomic::{AtomicU32, AtomicUsize, Ordering},
++};
++use wasmtime::{Caller, Config, Engine, Linker, Module, Store, Trap, unix::StoreExt};
++
++struct WriteBudget {
++    base: usize,
++    length: usize,
++    pages: AtomicU32,
++    limit: AtomicU32,
++    preflights: AtomicUsize,
++    signals: AtomicUsize,
++}
++impl WriteBudget {
++    fn permit(&self, address: usize, length: usize) -> bool {
++        if length == 0 {
++            return true;
++        }
++        let Some(end) = address.checked_add(length) else {
++            return false;
++        };
++        if end <= self.base || address >= self.base + self.length {
++            return true;
++        }
++        let Some(offset) = address.checked_sub(self.base) else {
++            return false;
++        };
++        let Some(end) = offset.checked_add(length).filter(|end| *end <= self.length) else {
++            return false;
++        };
++        let first = offset / 4096;
++        let last = (end - 1) / 4096;
++        let mask = ((u32::MAX >> (31 - (last - first))) << first) as u32;
++        let mut previous = self.pages.load(Ordering::Acquire);
++        loop {
++            let next = previous | mask;
++            if next.count_ones() > self.limit.load(Ordering::Relaxed) {
++                return false;
++            }
++            match self.pages.compare_exchange_weak(
++                previous,
++                next,
++                Ordering::AcqRel,
++                Ordering::Acquire,
++            ) {
++                Ok(_) => break,
++                Err(actual) => previous = actual,
++            }
++        }
++        unsafe {
++            libc::mprotect(
++                (self.base + first * 4096) as *mut _,
++                (last - first + 1) * 4096,
++                libc::PROT_READ | libc::PROT_WRITE,
++            ) == 0
++        }
++    }
++}
++struct DropWitness(Arc<AtomicUsize>);
++impl Drop for DropWitness {
++    fn drop(&mut self) {
++        self.0.fetch_add(1, Ordering::Relaxed);
++    }
++}
++#[test]
++fn protected_write_denial() -> wasmtime::Result<()> {
++    #[cfg(feature = "cranelift")]
++    check(wasmtime::Strategy::Cranelift)?;
++    #[cfg(feature = "winch")]
++    check(wasmtime::Strategy::Winch)?;
++    Ok(())
++}
++
++#[test]
++fn linear_growth_preflight() -> wasmtime::Result<()> {
++    #[cfg(feature = "cranelift")]
++    check_growth(wasmtime::Strategy::Cranelift)?;
++    #[cfg(feature = "winch")]
++    check_growth(wasmtime::Strategy::Winch)?;
++    Ok(())
++}
++
++pub(crate) fn check_growth(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
++    let mut config = Config::new();
++    config.strategy(strategy).memory_reservation(1 << 32);
++    let engine = Engine::new(&config)?;
++    let module = Module::new(
++        &engine,
++        r#"(module
++            (memory (export "memory") 1 3)
++            (data (i32.const 0) "prepared")
++            (func (export "grow") (param i32) (result i32)
++                local.get 0 memory.grow)
++            (func (export "grow_then_write")
++                i32.const 1 memory.grow drop
++                i32.const 0 i32.const 42 i32.store8))"#,
++    )?;
++    let mut store = Store::new(&engine, wasmtime::StoreLimitsBuilder::new().build());
++    store.limiter(|limits| limits);
++    let base = Arc::new(AtomicUsize::new(0));
++    let accepted_end = Arc::new(AtomicUsize::new(2 * 65536));
++    let calls = Arc::new(AtomicUsize::new(0));
++    let handler_base = base.clone();
++    let handler_end = accepted_end.clone();
++    let handler_calls = calls.clone();
++    unsafe {
++        store.set_memory_grow_handler(move |address, current, desired| {
++            assert_eq!(address, handler_base.load(Ordering::Relaxed));
++            assert!(current < desired);
++            handler_calls.fetch_add(1, Ordering::Relaxed);
++            desired <= handler_end.load(Ordering::Relaxed)
++        });
++    }
++    let instance = wasmtime::Instance::new(&mut store, &module, &[])?;
++    let memory = instance.get_memory(&mut store, "memory").unwrap();
++    base.store(memory.data_ptr(&store) as usize, Ordering::Relaxed);
++    let grow = instance.get_typed_func::<i32, i32>(&mut store, "grow")?;
++    let grow_then_write = instance.get_typed_func::<(), ()>(&mut store, "grow_then_write")?;
++    assert_eq!(grow.call(&mut store, 0)?, 1);
++    assert_eq!(calls.load(Ordering::Relaxed), 0);
++    assert_eq!(memory.grow(&mut store, 1)?, 1);
++    assert_eq!(calls.load(Ordering::Relaxed), 1);
++    assert_eq!(
++        memory.data_ptr(&store) as usize,
++        base.load(Ordering::Relaxed)
++    );
++    assert!(memory.data(&store)[65536..].iter().all(|byte| *byte == 0));
++
++    // Ordinary limiter refusal retains its recoverable Wasm semantics and
++    // cannot consume the separate private-exposure allowance.
++    *store.data_mut() = wasmtime::StoreLimitsBuilder::new()
++        .memory_size(2 * 65536)
++        .build();
++    assert_eq!(grow.call(&mut store, 1)?, -1);
++    assert_eq!(calls.load(Ordering::Relaxed), 1);
++    *store.data_mut() = wasmtime::StoreLimitsBuilder::new().build();
++
++    // The embedder's refusal must trap before subsequent guest writes even
++    // without a resource limiter that itself converts failures into traps.
++    let error = grow_then_write.call(&mut store, ()).unwrap_err();
++    assert_eq!(
++        error.downcast_ref::<Trap>(),
++        Some(&Trap::AllocationTooLarge)
++    );
++    assert_eq!(memory.data_size(&store), 2 * 65536);
++    assert_eq!(&memory.data(&store)[..8], b"prepared");
++    assert_eq!(calls.load(Ordering::Relaxed), 2);
++    accepted_end.store(3 * 65536, Ordering::Relaxed);
++    assert_eq!(grow.call(&mut store, 1)?, 2);
++    assert_eq!(calls.load(Ordering::Relaxed), 3);
++    assert_eq!(grow.call(&mut store, 1)?, -1);
++    assert!(memory.grow(&mut store, 1).is_err());
++    assert_eq!(calls.load(Ordering::Relaxed), 3);
++
++    // Equal capacities do not identify an allocation. Imports must reach the
++    // owning memory and the same hook, including when no limiter is installed.
++    let imports = Module::new(
++        &engine,
++        r#"(module
++            (import "" "memory" (memory 1 3))
++            (func (export "grow") (param i32) (result i32)
++                local.get 0 memory.grow))"#,
++    )?;
++    let mut store = Store::new(&engine, ());
++    let allowed = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, Some(3)))?;
++    let denied = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, Some(3)))?;
++    let allowed_base = allowed.data_ptr(&store) as usize;
++    let denied_base = denied.data_ptr(&store) as usize;
++    assert_ne!(allowed_base, denied_base);
++    unsafe {
++        store.set_memory_grow_handler(move |address, current, desired| {
++            assert!(current < desired);
++            if address == allowed_base {
++                true
++            } else {
++                assert_eq!(address, denied_base);
++                false
++            }
++        });
++    }
++    for (memory, should_grow) in [(allowed, true), (denied, false)] {
++        let instance = wasmtime::Instance::new(&mut store, &imports, &[memory.into()])?;
++        let result = instance
++            .get_typed_func::<i32, i32>(&mut store, "grow")?
++            .call(&mut store, 1);
++        if should_grow {
++            assert_eq!(result?, 1);
++            assert_eq!(memory.size(&store), 2);
++        } else {
++            assert_eq!(
++                result.unwrap_err().downcast_ref::<Trap>(),
++                Some(&Trap::AllocationTooLarge)
++            );
++            assert_eq!(memory.size(&store), 1);
++        }
++    }
++    assert_eq!(allowed.grow(&mut store, 1)?, 2);
++    assert_eq!(
++        denied.grow(&mut store, 1).unwrap_err().downcast_ref::<Trap>(),
++        Some(&Trap::AllocationTooLarge)
++    );
++    Ok(())
++}
++
++pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
++    let mut config = Config::new();
++    config.memory_init_cow(false).strategy(strategy);
++    config.module_version(wasmtime::ModuleVersionStrategy::None)?;
++    let engine = Engine::new(&config)?;
++    let module = Module::new(
++        &engine,
++        r#"(module
++      (import "host" "write" (func $host_write (param i32)))
++      (import "host" "nested" (func $nested))
++      (import "host" "register" (func $register))
++      (type $empty (func))
++      (table (export "table") 1 funcref)
++      (memory (export "memory") 2 3)
++      (data $bytes "abcdefgh")
++      (func (export "healthy") (result i32) i32.const 7)
++      (func (export "store") (param i32) local.get 0 i32.const 42 i32.store)
++      ;; This constant address is within the initial memory size. An optimizing
++      ;; compiler need not attach an out-of-bounds trap to this store.
++      (func (export "fixed_store") i32.const 4096 i32.const 42 i32.store)
++      (func (export "nested") call $nested)
++      (func (export "register_then_store")
++        call $register i32.const 0 call_indirect (type $empty))
++      (func (export "fill") (param i32 i32 i32) local.get 0 local.get 1 local.get 2 memory.fill)
++      (func (export "copy") (param i32 i32 i32) local.get 0 local.get 1 local.get 2 memory.copy)
++      (func (export "init") (param i32 i32 i32) local.get 0 local.get 1 local.get 2 memory.init $bytes)
++      (func (export "host_write") (param i32) local.get 0 call $host_write)
++    )"#,
++    )?;
++    let serialized = module.serialize()?;
++    let object = object::File::parse(serialized.as_slice())?;
++    let offset = object
++        .section_by_name(".wasmtime.engine")
++        .unwrap()
++        .file_range()
++        .unwrap()
++        .0 as usize;
++    assert_eq!(serialized[offset], 2);
++    for old_version in [0, 1] {
++        let mut old = serialized.clone();
++        old[offset] = old_version;
++        let error = unsafe { Module::deserialize(&engine, old) }
++            .err()
++            .expect("old builtin ABI must be rejected");
++        assert!(
++            error
++                .to_string()
++                .contains("mismatched version in engine section"),
++            "{error}"
++        );
++    }
++    let module = unsafe { Module::deserialize(&engine, serialized)? };
++    let drops = Arc::new(AtomicUsize::new(0));
++    let mut store = Store::new(&engine, drops.clone());
++    let mut linker = Linker::new(&engine);
++    linker.func_wrap(
++        "host",
++        "write",
++        |mut caller: Caller<'_, Arc<AtomicUsize>>, offset: i32| -> wasmtime::Result<()> {
++            let _witness = DropWitness(caller.data().clone());
++            let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
++            memory.write(&mut caller, offset as usize, &[19])?;
++            Ok(())
++        },
++    )?;
++    linker.func_wrap(
++        "host",
++        "nested",
++        |mut caller: Caller<'_, Arc<AtomicUsize>>| -> wasmtime::Result<()> {
++            let _witness = DropWitness(caller.data().clone());
++            let put = caller
++                .get_export("fixed_store")
++                .unwrap()
++                .into_func()
++                .unwrap()
++                .typed::<(), ()>(&caller)?;
++            let error = put.call(&mut caller, ()).unwrap_err();
++            assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::AllocationTooLarge));
++            // Catching the inner trap must let the outer Wasm activation resume.
++            Ok(())
++        },
++    )?;
++    linker.func_wrap(
++        "host",
++        "register",
++        |mut caller: Caller<'_, Arc<AtomicUsize>>| -> wasmtime::Result<()> {
++            let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
++            let table = caller.get_export("table").unwrap().into_table().unwrap();
++            let module = Module::new(
++                caller.engine(),
++                r#"(module
++                    (import "" "" (memory 2 3))
++                    (func (export "put") i32.const 4096 i32.const 1 i32.store))"#,
++            )?;
++            let instance = wasmtime::Instance::new(&mut caller, &module, &[memory.into()])?;
++            let put = instance.get_func(&mut caller, "put").unwrap();
++            table.set(&mut caller, 0, wasmtime::Ref::Func(Some(put)))?;
++            Ok(())
++        },
++    )?;
++    let instance = linker.instantiate(&mut store, &module)?;
++    let memory = instance.get_memory(&mut store, "memory").unwrap();
++    let base = memory.data_ptr(&store) as usize;
++    let length = memory.data_size(&store);
++    assert_eq!(length, 32 * 4096);
++    let budget = Arc::new(WriteBudget {
++        base,
++        length,
++        pages: AtomicU32::new(0),
++        limit: AtomicU32::new(1),
++        preflights: AtomicUsize::new(0),
++        signals: AtomicUsize::new(0),
++    });
++    let signal = budget.clone();
++    let writes = budget.clone();
++    unsafe {
++        store.set_signal_handler_with_trap(move |signum, info, context| {
++            if signum != libc::SIGSEGV || (*info).si_code != 2 {
++                return Ok(false);
++            }
++            let regs = &*(context as *const libc::ucontext_t);
++            let address = (*info).si_addr() as usize;
++            if regs.uc_mcontext.gregs[libc::REG_ERR as usize] & 2 == 0
++                || address < signal.base
++                || address >= signal.base + signal.length
++            {
++                return Ok(false);
++            }
++            signal.signals.fetch_add(1, Ordering::Relaxed);
++            if signal.permit(address, 1) {
++                Ok(true)
++            } else {
++                Err(Trap::AllocationTooLarge)
++            }
++        })?;
++        store.set_memory_write_handler(move |address, length| {
++            writes.preflights.fetch_add(1, Ordering::Relaxed);
++            writes.permit(address, length)
++        });
++        assert_eq!(libc::mprotect(base as *mut _, length, libc::PROT_READ), 0);
++    }
++    let put = instance.get_typed_func::<i32, ()>(&mut store, "store")?;
++    put.call(&mut store, 0)?;
++    assert_eq!(budget.signals.load(Ordering::Relaxed), 1);
++    let error = put.call(&mut store, 4096).unwrap_err();
++    assert_eq!(
++        error.downcast_ref::<Trap>(),
++        Some(&Trap::AllocationTooLarge)
++    );
++    assert_eq!(budget.pages.load(Ordering::Relaxed).count_ones(), 1);
++    assert!(error.downcast_ref::<wasmtime::WasmBacktrace>().is_none());
++    let error = instance
++        .get_typed_func::<(), ()>(&mut store, "fixed_store")?
++        .call(&mut store, ())
++        .unwrap_err();
++    assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::AllocationTooLarge));
++    instance
++        .get_typed_func::<(), ()>(&mut store, "nested")?
++        .call(&mut store, ())?;
++    assert_eq!(drops.load(Ordering::Relaxed), 1);
++    // The active Store's signal-safe ranges must include a module registered by
++    // a host callback, even when its function is called without a new host entry.
++    let error = instance
++        .get_typed_func::<(), ()>(&mut store, "register_then_store")?
++        .call(&mut store, ())
++        .unwrap_err();
++    assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::AllocationTooLarge));
++    assert_eq!(
++        instance
++            .get_typed_func::<(), i32>(&mut store, "healthy")?
++            .call(&mut store, ())?,
++        7
++    );
++    let signals = budget.signals.load(Ordering::Relaxed);
++    for (name, arguments) in [
++        ("fill", (4096, 3, 4096)),
++        ("copy", (4096, 0, 4096)),
++        ("init", (4096, 0, 8)),
++    ] {
++        let before = budget.preflights.load(Ordering::Relaxed);
++        let error = instance
++            .get_typed_func::<(i32, i32, i32), ()>(&mut store, name)?
++            .call(&mut store, arguments)
++            .unwrap_err();
++        assert_eq!(
++            error.downcast_ref::<Trap>(),
++            Some(&Trap::AllocationTooLarge),
++            "{name}: {error}"
++        );
++        assert_eq!(budget.preflights.load(Ordering::Relaxed), before + 1);
++        assert_eq!(budget.signals.load(Ordering::Relaxed), signals);
++    }
++    assert!(
++        memory
++            .write(&mut store, 4096, &[1])
++            .unwrap_err()
++            .is_write_denied()
++    );
++    assert!(
++        memory
++            .data_mut_range(&mut store, 4096..4100)
++            .unwrap_err()
++            .is_write_denied()
++    );
++    let error = instance
++        .get_typed_func::<i32, ()>(&mut store, "host_write")?
++        .call(&mut store, 4096)
++        .unwrap_err();
++    assert!(
++        error
++            .downcast_ref::<wasmtime::MemoryAccessError>()
++            .unwrap()
++            .is_write_denied()
++    );
++    assert_eq!(drops.load(Ordering::Relaxed), 2);
++    // The infallible whole-memory APIs must reject instead of handing out a
++    // slice that would fault later in arbitrary host code.
++    for with_store_data in [false, true] {
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            if with_store_data {
++                let _ = memory.data_and_store_mut(&mut store);
++            } else {
++                let _ = memory.data_mut(&mut store);
++            }
++        }));
++        assert!(result.is_err());
++    }
++    let before = budget.preflights.load(Ordering::Relaxed);
++    assert!(
++        !memory
++            .write(&mut store, usize::MAX, &[1])
++            .unwrap_err()
++            .is_write_denied()
++    );
++    assert!(memory.data_mut_range(&mut store, length..length)?.is_empty());
++    assert!(!memory
++        .data_mut_range(&mut store, 5..4)
++        .unwrap_err()
++        .is_write_denied());
++    for (name, source_end) in [("fill", 0), ("copy", length), ("init", 8)] {
++        let operation = instance
++            .get_typed_func::<(i32, i32, i32), ()>(&mut store, name)?;
++        operation.call(&mut store, (length as i32, source_end as i32, 0))?;
++        let error = operation
++            .call(&mut store, (length as i32 + 1, source_end as i32, 0))
++            .unwrap_err();
++        assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::MemoryOutOfBounds));
++    }
++    // A bad source has priority over a denied (but in-bounds) destination.
++    for (name, source_end) in [("copy", length), ("init", 8)] {
++        let error = instance
++            .get_typed_func::<(i32, i32, i32), ()>(&mut store, name)?
++            .call(&mut store, (4096, source_end as i32, 1))
++            .unwrap_err();
++        assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::MemoryOutOfBounds));
++    }
++    assert_eq!(budget.preflights.load(Ordering::Relaxed), before);
++    assert_eq!(&memory.data(&store)[4096..8192], &[0; 4096]);
++    assert_eq!(&memory.data(&store)[..4], &42i32.to_le_bytes());
++    budget.limit.store(2, Ordering::Relaxed);
++    instance
++        .get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?
++        .call(&mut store, (4096, 3, 4096))?;
++    assert_eq!(&memory.data(&store)[4096..8192], &[3; 4096]);
++    assert_eq!(budget.pages.load(Ordering::Relaxed).count_ones(), 2);
++    memory.data_mut_range(&mut store, 4096..4098)?
++        .copy_from_slice(&[6, 7]);
++    assert_eq!(&memory.data(&store)[4096..4098], &[6, 7]);
++    memory.write(&mut store, 0, &[1, 2, 3, 4, 5])?;
++    instance
++        .get_typed_func::<(i32, i32, i32), ()>(&mut store, "copy")?
++        .call(&mut store, (1, 0, 4))?;
++    assert_eq!(&memory.data(&store)[..5], &[1, 1, 2, 3, 4]);
++    {
++        store.call_hook(|_, event| {
++            if matches!(event, wasmtime::CallHook::CallingHost) {
++                wasmtime::bail!("bulk operations must not invoke reentrant call hooks");
++            }
++            Ok(())
++        });
++        for name in ["fill", "copy", "init"] {
++            instance
++                .get_typed_func::<(i32, i32, i32), ()>(&mut store, name)?
++                .call(&mut store, (0, 0, 1))?;
++        }
++    }
++    budget.limit.store(32, Ordering::Relaxed);
++    memory.data_mut(&mut store)[length - 1] = 11;
++    {
++        let (bytes, store_drops) = memory.data_and_store_mut(&mut store);
++        assert!(Arc::ptr_eq(store_drops, &drops));
++        assert_eq!(bytes[length - 1], 11);
++        bytes[length - 1] = 12;
++    }
++    assert_eq!(memory.data(&store)[length - 1], 12);
++    assert_eq!(budget.pages.load(Ordering::Relaxed).count_ones(), 32);
++    // A native callback panic must return through its Rust frames before the
++    // trampoline unwinds Wasm and resumes the panic at the host call boundary.
++    let callback_drops = drops.clone();
++    unsafe {
++        store.set_memory_write_handler(move |_, _| {
++            let _witness = DropWitness(callback_drops.clone());
++            panic!("write callback panic");
++        });
++    }
++    let fill = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "fill")?;
++    let before = memory.data(&store)[0];
++    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        fill.call(&mut store, (0, 99, 1))
++    }));
++    assert!(result.is_err());
++    assert_eq!(drops.load(Ordering::Relaxed), 3);
++    assert_eq!(memory.data(&store)[0], before);
++    assert_eq!(
++        instance
++            .get_typed_func::<(), i32>(&mut store, "healthy")?
++            .call(&mut store, ())?,
++        7
++    );
++    unsafe {
++        assert_eq!(
++            libc::mprotect(base as *mut _, length, libc::PROT_READ | libc::PROT_WRITE),
++            0
++        );
++    }
++    Ok(())
++}
+diff --git a/tests/all/metering_polling.rs b/tests/all/metering_polling.rs
+index ea7e0c7d2e236e87b2c25a94751ec28c9c0bf14a..cbd8121820157d41eebe453bf4953ba5ae189fb6 100644
+--- a/tests/all/metering_polling.rs
++++ b/tests/all/metering_polling.rs
+@@ -610,7 +610,7 @@ fn polling_artifact_identity_and_metadata_versions() {
+         let (offset, len) = section.file_range().unwrap();
+         let offset = usize::try_from(offset).unwrap();
+         let len = usize::try_from(len).unwrap();
+-        assert_eq!(artifact[offset], u8::from(interval != 0));
++        assert_eq!(artifact[offset], if interval == 0 { 2 } else { 3 });
+         if interval != 0 {
+             // These intervals fit in one postcard byte. A zero extension must
+             // not turn an artifact without internal checks into a legacy one.
+diff --git a/winch/codegen/src/codegen/mod.rs b/winch/codegen/src/codegen/mod.rs
+index 1fbd393c49ada785194578223b8bb1c4911304f2..23ed1dc77f8cfbd71a2777b18aec3840c5367a6c 100644
+--- a/winch/codegen/src/codegen/mod.rs
++++ b/winch/codegen/src/codegen/mod.rs
+@@ -1734,7 +1734,9 @@ where
+             &mut self.context,
+             Callee::Builtin(builtin),
+         )?;
+-        Ok(())
++        // The trampoline consumes a false result as a trap; its successful
++        // result is not a value produced by the WebAssembly instruction.
++        self.context.pop_and_free(self.masm)
+     }
+ 
+     /// Emit the `memory.fill` operation.
+@@ -1779,7 +1781,9 @@ where
+             &mut self.context,
+             Callee::Builtin(builtin),
+         )?;
+-        Ok(())
++        // The trampoline consumes a false result as a trap; its successful
++        // result is not a value produced by the WebAssembly instruction.
++        self.context.pop_and_free(self.masm)
+     }
+ 
+     /// Emit the `memory.init` operation.
+@@ -1885,7 +1889,9 @@ where
+             &mut self.context,
+             Callee::Builtin(builtin),
+         )?;
+-        Ok(())
++        // The trampoline consumes a false result as a trap; its successful
++        // result is not a value produced by the WebAssembly instruction.
++        self.context.pop_and_free(self.masm)
+     }
+ 
+     pub fn emit_data_drop(&mut self, data_index: DataIndex) -> Result<()> {

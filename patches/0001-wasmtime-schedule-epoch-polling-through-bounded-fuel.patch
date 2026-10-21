@@ -1,0 +1,2068 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 14 Oct 2026 15:00:18 +0800
+Subject: [PATCH 1/3] wasmtime: schedule epoch polling through bounded fuel
+ refills
+
+Add an engine-owned polling interval that reuses fuel refills for private
+entry and loop checks. Preserve native and escaping entry, startup,
+host-return and rooted exception-continuation checks, callback yields,
+interruptions and exact fuel accounting. Reject unsupported execution
+modes rather than accepting incomplete continuation coverage.
+
+Retain register-preserving metering handlers and their GC stack-map
+support. Reload authoritative fuel on caught exceptions so unwinding
+cannot restore stale caller charges.
+
+Keep zero-interval engine metadata and compatibility hash inputs identical
+to the pinned upstream representation. Encode nonzero intervals in a
+separate versioned metadata extension and reject mismatched intervals.
+This permits independent compatible upgrades while older runtimes reject
+artifacts that rely on the new runtime polling contract.
+
+Sixteen focused metering and artifact tests pass with both null and moving
+copying collectors. Cross-version probes execute legacy and new zero-mode
+artifacts in both directions with matching output and fuel, compare exact
+metadata and hash inputs, and verify old-runtime rejection of polling
+artifacts even with module version-string checks disabled.
+---
+ DOWNSTREAM.md                                 |   40 +
+ cranelift/frontend/src/frontend/safepoints.rs |  154 ++-
+ crates/cranelift/src/compiler.rs              |   27 +-
+ crates/cranelift/src/func_environ.rs          |  102 +-
+ .../src/translate/code_translator.rs          |    2 +
+ crates/environ/src/tunables.rs                |   25 +-
+ crates/wasmtime/src/config.rs                 |   62 +
+ crates/wasmtime/src/engine/serialization.rs   |   43 +-
+ crates/wasmtime/src/runtime/store.rs          |   11 +-
+ crates/wasmtime/src/runtime/vm/libcalls.rs    |   14 +-
+ tests/all/main.rs                             |    1 +
+ tests/all/metering_polling.rs                 | 1122 +++++++++++++++++
+ 12 files changed, 1547 insertions(+), 56 deletions(-)
+ create mode 100644 DOWNSTREAM.md
+ create mode 100644 tests/all/metering_polling.rs
+
+diff --git a/DOWNSTREAM.md b/DOWNSTREAM.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ba548c37a14c2d25dff7cbc7f2479858527bb66
+--- /dev/null
++++ b/DOWNSTREAM.md
+@@ -0,0 +1,40 @@
++# Downstream metering changes
++
++This source starts at upstream revision
++`7ad2e732ab9ca8665d3cdd91f9c395315eeafc81`. It owns the shared compilation and
++runtime changes below so AOT producers and runtime consumers can pin the same
++implementation without maintaining separate source copies.
++
++- Fuel and epoch slow handlers preserve live registers. Stack-map construction
++  supports the values that remain live across these calls.
++- Exception catch entry reloads authoritative fuel, including charges incurred
++  by callees before unwinding.
++- `Config::fuel_epoch_poll_interval` optionally schedules internal epoch checks
++  at bounded fuel refills. Native and escaping entries, startup, successful host
++  returns, and rooted exception continuations retain checks. Deadline callbacks,
++  asynchronous yields, interruptions, and exact fuel accounting remain active.
++
++The interval is an engine setting inherited by every store. Zero preserves the
++ordinary instrumentation, version-zero engine metadata bytes, and engine hash
++input. Nonzero intervals use version-one metadata with an explicit interval;
++an older runtime rejects that format even with module version-string validation
++disabled. A consumer must use the same interval as its producer. Source-keyed
++build caches must still invalidate changed compilation code; artifact
++compatibility does not establish that an older artifact includes a newer fix.
++
++Polling supports core modules with default operator costs, fuel consumption, and
++epoch interruption. Components have separate host-call trampolines and are not
++supported by this mode. Stack switching, shared-memory threads, guest debugging,
++recording, component concurrency, and separately configured asynchronous fuel
++yields are also rejected. An interval bounds fuel slices, not wall time: native
++host work and individual guest operations have varying duration, and a straight
++line block may overshoot the active slice before its next checkpoint.
++
++`tests/all/metering_polling.rs` covers metering values and accounting, exceptions,
++entry and continuation boundaries, interruption and yield behavior, reference
++rooting through collection, configuration rejection, and artifact identities.
++Run it with both null and copying collector configurations. Cross-version
++acceptance also requires executing legacy artifacts in the new zero-interval
++runtime, executing new zero-interval artifacts in the legacy runtime, comparing
++their engine metadata and hash inputs, and checking rejection of polling
++artifacts by the legacy runtime.
+diff --git a/cranelift/frontend/src/frontend/safepoints.rs b/cranelift/frontend/src/frontend/safepoints.rs
+index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e7699264377a535133 100644
+--- a/cranelift/frontend/src/frontend/safepoints.rs
++++ b/cranelift/frontend/src/frontend/safepoints.rs
+@@ -104,6 +104,13 @@ impl<T> SlotSizeMap<T> {
+ /// values to ensure deterministic output.
+ type LiveSet = HashSet<ir::Value>;
+ 
++#[derive(Clone, Copy)]
++enum LivenessEvent {
++    Def(ir::Value),
++    Use(ir::Inst, ir::Value),
++    Safepoint(ir::Inst),
++}
++
+ /// A worklist of blocks' post-order indices that we need to process.
+ #[derive(Default)]
+ struct Worklist {
+@@ -270,6 +277,12 @@ pub(crate) struct LivenessAnalysis {
+     /// The set of values that are live across *any* safepoint in the function,
+     /// i.e. the union of all the values in the `safepoints` map.
+     live_across_any_safepoint: EntitySet<ir::Value>,
++
++    // Scalar instructions do not affect GC-reference liveness. Resolve aliases
++    // and retain the relevant events once, before revisiting loop blocks and
++    // recording final safepoint sets. Liveness does not otherwise mutate IR.
++    events: Vec<LivenessEvent>,
++    block_events: Vec<core::ops::Range<usize>>,
+ }
+ 
+ impl Default for LivenessAnalysis {
+@@ -285,6 +298,8 @@ impl Default for LivenessAnalysis {
+             currently_live: Default::default(),
+             safepoints: Default::default(),
+             live_across_any_safepoint: Default::default(),
++            events: Default::default(),
++            block_events: Default::default(),
+         }
+     }
+ }
+@@ -310,6 +325,8 @@ impl LivenessAnalysis {
+             currently_live,
+             safepoints,
+             live_across_any_safepoint,
++            events,
++            block_events,
+         } = self;
+         dfs.clear();
+         post_order.clear();
+@@ -321,6 +338,8 @@ impl LivenessAnalysis {
+         currently_live.clear();
+         safepoints.clear();
+         live_across_any_safepoint.clear();
++        events.clear();
++        block_events.clear();
+     }
+ 
+     /// Given that we've initialized `self.post_order`, reserve capacity for the
+@@ -337,6 +356,8 @@ impl LivenessAnalysis {
+             currently_live: _,
+             safepoints: _,
+             live_across_any_safepoint: _,
++            events: _,
++            block_events,
+         } = self;
+ 
+         block_to_index.resize(func.dfg.num_blocks());
+@@ -346,6 +367,7 @@ impl LivenessAnalysis {
+         predecessors.resize(capacity, Default::default());
+         live_ins.resize(capacity, Default::default());
+         live_outs.resize(capacity, Default::default());
++        block_events.reserve(capacity);
+     }
+ 
+     fn initialize_block_to_index_map(&mut self) {
+@@ -376,6 +398,9 @@ impl LivenessAnalysis {
+ 
+     /// Record the live set of needs-stack-map values at the given safepoint.
+     fn record_safepoint(&mut self, func: &Function, inst: Inst) {
++        if self.currently_live.is_empty() {
++            return;
++        }
+         log::trace!(
+             "liveness:   found safepoint: {inst:?}: {}",
+             func.dfg.display_inst(inst)
+@@ -404,11 +429,40 @@ impl LivenessAnalysis {
+         }
+     }
+ 
+-    /// Process all the instructions in a block in reverse order.
++    fn initialize_events(&mut self, func: &mut Function, stack_map_values: &EntitySet<ir::Value>) {
++        for &block in &self.post_order {
++            let start = self.events.len();
++            let mut option_inst = func.layout.last_inst(block);
++            while let Some(inst) = option_inst {
++                for &val in func.dfg.inst_results(inst) {
++                    if stack_map_values.contains(val) {
++                        self.events.push(LivenessEvent::Def(val));
++                    }
++                }
++                if func.dfg.insts[inst].opcode().is_safepoint() {
++                    self.events.push(LivenessEvent::Safepoint(inst));
++                }
++                for val in func.dfg.inst_values(inst) {
++                    let val = func.dfg.resolve_aliases(val);
++                    if stack_map_values.contains(val) {
++                        self.events.push(LivenessEvent::Use(inst, val));
++                    }
++                }
++                option_inst = func.layout.prev_inst(inst);
++            }
++            for &val in func.dfg.block_params(block) {
++                if stack_map_values.contains(val) {
++                    self.events.push(LivenessEvent::Def(val));
++                }
++            }
++            self.block_events.push(start..self.events.len());
++        }
++    }
++
++    /// Apply the block's relevant instructions in reverse order.
+     fn process_block(
+         &mut self,
+         func: &mut Function,
+-        stack_map_values: &EntitySet<ir::Value>,
+         block_index: usize,
+         record_safepoints: RecordSafepoints,
+     ) {
+@@ -420,37 +474,16 @@ impl LivenessAnalysis {
+         self.currently_live
+             .extend(self.live_outs[block_index].iter().copied());
+ 
+-        // Now process this block's instructions, incrementally building its
+-        // live-in set inside the currently-live set.
+-        let mut option_inst = func.layout.last_inst(block);
+-        while let Some(inst) = option_inst {
+-            // Process any needs-stack-map values defined by this instruction.
+-            for val in func.dfg.inst_results(inst) {
+-                self.process_def(func, *val);
+-            }
+-
+-            // If this instruction is a safepoint and we've been asked to record
+-            // safepoints, then do so.
+-            let opcode = func.dfg.insts[inst].opcode();
+-            if record_safepoints == RecordSafepoints::Yes && opcode.is_safepoint() {
+-                self.record_safepoint(func, inst);
+-            }
+-
+-            // Process any needs-stack-map values used by this instruction.
+-            for val in func.dfg.inst_values(inst) {
+-                let val = func.dfg.resolve_aliases(val);
+-                if stack_map_values.contains(val) {
+-                    self.process_use(func, inst, val);
++        for index in self.block_events[block_index].clone() {
++            match self.events[index] {
++                LivenessEvent::Def(val) => self.process_def(func, val),
++                LivenessEvent::Use(inst, val) => self.process_use(func, inst, val),
++                LivenessEvent::Safepoint(inst) => {
++                    if record_safepoints == RecordSafepoints::Yes {
++                        self.record_safepoint(func, inst);
++                    }
+                 }
+             }
+-
+-            option_inst = func.layout.prev_inst(inst);
+-        }
+-
+-        // After we've processed this block's instructions, remove its
+-        // parameters from the live set. This is part of step (1).
+-        for val in func.dfg.block_params(block) {
+-            self.process_def(func, *val);
+         }
+     }
+ 
+@@ -461,6 +494,7 @@ impl LivenessAnalysis {
+         self.reserve_capacity(func);
+         self.initialize_block_to_index_map();
+         self.initialize_predecessors_map(func);
++        self.initialize_events(func, stack_map_values);
+ 
+         // Initially enqueue all blocks for processing. We push them in reverse
+         // post-order (which yields them in post-order when popped) because if
+@@ -494,7 +528,7 @@ impl LivenessAnalysis {
+             // Process the block to compute its live-in set, but do not record
+             // safepoints yet, as we haven't yet processed loop back edges (see
+             // below).
+-            self.process_block(func, stack_map_values, block_index, RecordSafepoints::No);
++            self.process_block(func, block_index, RecordSafepoints::No);
+ 
+             // The live-in set for a block is the set of values that are still
+             // live after the block's instructions have been processed.
+@@ -517,7 +551,7 @@ impl LivenessAnalysis {
+         // each safepoint instruction in each block, backwards from the block's
+         // live-out set.
+         for block_index in 0..self.post_order.len() {
+-            self.process_block(func, stack_map_values, block_index, RecordSafepoints::Yes);
++            self.process_block(func, block_index, RecordSafepoints::Yes);
+ 
+             debug_assert_eq!(
+                 self.currently_live, self.live_ins[block_index],
+@@ -649,7 +683,9 @@ impl SafepointSpiller {
+ 
+         self.clear();
+         self.liveness.run(func, stack_map_values);
+-        self.rewrite(func, pointer_type);
++        if !self.liveness.live_across_any_safepoint.is_empty() {
++            self.rewrite(func, pointer_type);
++        }
+ 
+         log::trace!(
+             "after inserting safepoint spills and reloads:\n{}",
+@@ -885,6 +921,56 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn dead_reference_then_live_reference_with_reused_context() {
++        let mut context = FunctionBuilderContext::new();
++        for live_after_call in [false, true, false] {
++            let mut signature = Signature::new(CallConv::SystemV);
++            signature.params.push(AbiParam::new(ir::types::I32));
++            signature.returns.push(AbiParam::new(ir::types::I32));
++            let mut func = Function::with_name_signature(
++                ir::UserFuncName::testcase("reference_lifetime"),
++                signature,
++            );
++            let mut builder = FunctionBuilder::new(&mut func, &mut context);
++            let block = builder.create_block();
++            builder.append_block_params_for_function_params(block);
++            builder.switch_to_block(block);
++            let reference = builder.block_params(block)[0];
++            builder.declare_value_needs_stack_map(reference);
++            let name = builder
++                .func
++                .declare_imported_user_function(ir::UserExternalName {
++                    namespace: 0,
++                    index: 0,
++                });
++            let mut signature = Signature::new(CallConv::SystemV);
++            signature.params.push(AbiParam::new(ir::types::I32));
++            let signature = builder.func.import_signature(signature);
++            let target = builder.import_function(ir::ExtFuncData {
++                name: ir::ExternalName::user(name),
++                signature,
++                colocated: true,
++                patchable: false,
++            });
++            let scalar = builder.ins().iconst(ir::types::I32, 0);
++            let mut scalar = scalar;
++            for _ in 0..128 {
++                scalar = builder.ins().iadd_imm(scalar, 1);
++            }
++            builder.ins().call(target, &[reference]);
++            builder
++                .ins()
++                .return_(&[if live_after_call { reference } else { scalar }]);
++            builder.seal_all_blocks();
++            builder.finalize(systemv_frontend_config());
++            let output = func.display().to_string();
++            assert_eq!(output.contains("stack_map=[i32 @ ss0+0]"), live_after_call);
++            assert_eq!(output.contains("store notrap aligned"), live_after_call);
++            assert_eq!(output.contains("load.i32 notrap aligned"), live_after_call);
++        }
++    }
++
+     #[test]
+     fn needs_stack_map_and_loop() {
+         let mut sig = Signature::new(CallConv::SystemV);
+diff --git a/crates/cranelift/src/compiler.rs b/crates/cranelift/src/compiler.rs
+index f540f1b860f2e67b192fcf77beb09147e4246e6e..edd696b1992ab85d58559720bfc165e6e953b438 100644
+--- a/crates/cranelift/src/compiler.rs
++++ b/crates/cranelift/src/compiler.rs
+@@ -1,7 +1,7 @@
+ use crate::TRAP_INTERNAL_ASSERT;
+ use crate::alias_region::AliasRegions;
+ use crate::debug::DwarfSectionRelocTarget;
+-use crate::func_environ::FuncEnvironment;
++use crate::func_environ::{BuiltinFunctions, FuncEnvironment, emit_epoch_check_at_boundary};
+ use crate::translate::{FuncTranslator, VmctxLoadChain};
+ use crate::{BuiltinFunctionSignatures, builder::LinkOptions, wasm_call_signature};
+ use crate::{CompiledFunction, ModuleTextBuilder, array_call_signature};
+@@ -297,7 +297,7 @@ impl Compiler {
+         let succeeded = builder.func.dfg.inst_results(call)[0];
+         self.raise_if_host_trapped(&mut builder, &mut alias_regions, caller_vmctx, succeeded);
+ 
+-        // Return results from the array as native return values.
++        // Load host results before any callback that may collect garbage.
+         let results = self.load_values_from_array(
+             &mut alias_regions,
+             wasm_func_ty.results(),
+@@ -305,6 +305,29 @@ impl Compiler {
+             args_base,
+             args_len,
+         );
++        if self.tunables.fuel_epoch_poll_interval != 0 {
++            for (value, ty) in results.iter().zip(wasm_func_ty.results()) {
++                if let WasmValType::Ref(reference) = ty
++                    && reference.heap_type.is_vmgcref_type_and_not_i31()
++                    && !reference.heap_type.is_bottom()
++                {
++                    builder.declare_value_needs_stack_map(*value);
++                }
++            }
++        }
++
++        if self.tunables.fuel_epoch_poll_interval != 0 {
++            // Host calls may consume wall time or suspend without using fuel.
++            // Check before returning their results to the guest continuation.
++            let mut builtins = BuiltinFunctions::new(self);
++            emit_epoch_check_at_boundary(
++                &mut builder,
++                &mut alias_regions,
++                &mut builtins,
++                caller_vmctx,
++            );
++        }
++
+         builder.ins().return_(&results);
+         builder.finalize(self.isa().frontend_config());
+         crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(
+diff --git a/crates/cranelift/src/func_environ.rs b/crates/cranelift/src/func_environ.rs
+index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8ec700329 100644
+--- a/crates/cranelift/src/func_environ.rs
++++ b/crates/cranelift/src/func_environ.rs
+@@ -93,8 +93,20 @@ impl BuiltinFunctions {
+         if let Some(f) = cache {
+             return *f;
+         }
+-        let signature = func.import_signature(self.types.wasm_signature(builtin));
+-        let key = FuncKey::WasmToBuiltinTrampoline(builtin);
++        let mut signature = self.types.wasm_signature(builtin);
++        let key = if builtin == BuiltinFunctionIndex::out_of_gas()
++            || builtin == BuiltinFunctionIndex::new_epoch()
++        {
++            // Preserve live registers inside these uncommon handlers instead of
++            // making every instrumented caller accommodate their clobbers. Their
++            // updated fuel and epoch deadline are reloaded from the store.
++            signature.returns.clear();
++            signature.call_conv = CallConv::PreserveAll;
++            FuncKey::PatchableToBuiltinTrampoline(builtin)
++        } else {
++            FuncKey::WasmToBuiltinTrampoline(builtin)
++        };
++        let signature = func.import_signature(signature);
+         let (namespace, index) = key.into_raw_parts();
+         let name = ir::ExternalName::User(
+             func.declare_imported_user_function(ir::UserExternalName { namespace, index }),
+@@ -149,6 +161,46 @@ macro_rules! declare_function_signatures {
+ }
+ wasmtime_environ::foreach_builtin_function!(declare_function_signatures);
+ 
++// Continuations after host work cannot reuse a cached deadline or wait for
++// another fuel slice. All live GC references must already be in stack maps.
++pub(crate) fn emit_epoch_check_at_boundary<O: wasmtime_environ::GetPtrSize>(
++    builder: &mut FunctionBuilder<'_>,
++    alias_regions: &mut AliasRegions<O>,
++    builtins: &mut BuiltinFunctions,
++    vmctx: ir::Value,
++) {
++    let epoch_ptr = alias_regions
++        .vmctx()
++        .epoch_ptr()
++        .load(&mut builder.cursor(), vmctx);
++    let epoch = alias_regions
++        .vmctx()
++        .epoch_counter()
++        .load(&mut builder.cursor(), epoch_ptr);
++    let context = alias_regions
++        .vmctx()
++        .store_context()
++        .load(&mut builder.cursor(), vmctx);
++    let deadline = alias_regions
++        .vm_store_context()
++        .epoch_deadline()
++        .load(&mut builder.cursor(), context);
++    let expired = builder
++        .ins()
++        .icmp(IntCC::UnsignedGreaterThanOrEqual, epoch, deadline);
++    let poll = builder.create_block();
++    let resume = builder.create_block();
++    builder.set_cold_block(poll);
++    builder.ins().brif(expired, poll, &[], resume, &[]);
++    builder.seal_block(poll);
++    builder.switch_to_block(poll);
++    let new_epoch = builtins.new_epoch(builder.func);
++    builder.ins().call(new_epoch, &[vmctx]);
++    builder.ins().jump(resume, &[]);
++    builder.seal_block(resume);
++    builder.switch_to_block(resume);
++}
++
+ /// The `FuncEnvironment` implementation for use by the `ModuleEnvironment`.
+ pub struct FuncEnvironment<'module_environment> {
+     compiler: &'module_environment Compiler,
+@@ -194,6 +246,7 @@ pub struct FuncEnvironment<'module_environment> {
+     pub(crate) offsets: VMOffsets<u8>,
+ 
+     tunables: &'module_environment Tunables,
++    epoch_entry_required: bool,
+ 
+     /// A function-local variable which stores the cached value of the amount of
+     /// fuel remaining to execute. If used this is modified frequently so it's
+@@ -303,6 +356,8 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+             builtin_functions,
+             offsets,
+             tunables,
++            epoch_entry_required: func_index
++                .is_none_or(|index| translation.module.functions[index].is_escaping()),
+             fuel_var: Variable::reserved_value(),
+             epoch_deadline_var: Variable::reserved_value(),
+             epoch_ptr_var: Variable::reserved_value(),
+@@ -677,6 +732,30 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+         }
+     }
+ 
++    pub(crate) fn translate_exception_entry(&mut self, builder: &mut FunctionBuilder<'_>) {
++        if self.tunables.consume_fuel {
++            // An exceptional return bypasses fuel_after_op. The callee may have
++            // consumed or refilled fuel before unwinding to this handler.
++            self.fuel_load_into_var(builder);
++        }
++    }
++
++    pub(crate) fn translate_exception_poll(&mut self, builder: &mut FunctionBuilder<'_>) {
++        if self.tunables.fuel_epoch_poll_interval != 0 {
++            // A host exception bypasses the successful host-return trampoline.
++            // Catch lowering has rooted its exception reference before this call.
++            let vmctx = self.vmctx_val(&mut builder.cursor());
++            emit_epoch_check_at_boundary(
++                builder,
++                &mut self.alias_regions,
++                &mut self.builtin_functions,
++                vmctx,
++            );
++            // The deadline callback may reenter Wasm or change the fuel budget.
++            self.fuel_load_into_var(builder);
++        }
++    }
++
+     /// Adds `self.fuel_consumed` to the `fuel_var`, zero-ing out the amount of
+     /// fuel consumed at that point.
+     fn fuel_increment_var(&mut self, builder: &mut FunctionBuilder<'_>) {
+@@ -718,6 +797,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+     fn fuel_check(&mut self, builder: &mut FunctionBuilder) {
+         self.fuel_increment_var(builder);
+         let out_of_gas_block = builder.create_block();
++        builder.set_cold_block(out_of_gas_block);
+         let continuation_block = builder.create_block();
+ 
+         // Note that our fuel is encoded as adding positive values to a
+@@ -899,10 +979,14 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+ 
+         let new_epoch = self.builtin_functions.new_epoch(builder.func);
+         let vmctx = self.vmctx_val(&mut builder.cursor());
+-        // new_epoch() returns the new deadline, so we don't have to
+-        // reload it.
+-        let call = builder.ins().call(new_epoch, &[vmctx]);
+-        let new_deadline = *builder.func.dfg.inst_results(call).first().unwrap();
++        // The preserving trampoline has no return registers. The host commits
++        // the new deadline before returning, including after an async yield.
++        builder.ins().call(new_epoch, &[vmctx]);
++        let new_deadline = self
++            .alias_regions
++            .vm_store_context()
++            .epoch_deadline()
++            .load(&mut builder.cursor(), vmstore_ctx);
+         builder.def_var(self.epoch_deadline_var, new_deadline);
+         builder.ins().jump(continuation_block, &[]);
+         builder.seal_block(continuation_block);
+@@ -5238,7 +5322,7 @@ impl FuncEnvironment<'_> {
+ 
+         // If we are performing epoch-based interruption, check to see
+         // if the epoch counter has changed.
+-        if self.tunables.epoch_interruption {
++        if self.tunables.epoch_interruption && self.tunables.fuel_epoch_poll_interval == 0 {
+             self.epoch_check(builder);
+         }
+     }
+@@ -5304,7 +5388,9 @@ impl FuncEnvironment<'_> {
+         }
+ 
+         // Initialize `epoch_var` with the current epoch.
+-        if self.tunables.epoch_interruption {
++        if self.tunables.epoch_interruption
++            && (self.tunables.fuel_epoch_poll_interval == 0 || self.epoch_entry_required)
++        {
+             self.epoch_function_entry(builder);
+         }
+ 
+diff --git a/crates/cranelift/src/translate/code_translator.rs b/crates/cranelift/src/translate/code_translator.rs
+index 4ed39e1cabbe31b06e966b9e18f670d411f8f7af..8be71cf1567b6cff7bbcb41437406ee39be583ab 100644
+--- a/crates/cranelift/src/translate/code_translator.rs
++++ b/crates/cranelift/src/translate/code_translator.rs
+@@ -4631,6 +4631,7 @@ fn create_catch_block(
+     let block = builder.create_block();
+     let exn_ref = builder.append_block_param(block, exn_payload_ty);
+     builder.switch_to_block(block);
++    environ.translate_exception_entry(builder);
+     debug_assert!(exn_ref_ty.bits() <= exn_payload_ty.bits());
+     let exn_ref = if exn_ref_ty.bits() < exn_payload_ty.bits() {
+         builder.ins().ireduce(exn_ref_ty, exn_ref)
+@@ -4641,6 +4642,7 @@ fn create_catch_block(
+     if needs_stack_map {
+         builder.declare_value_needs_stack_map(exn_ref);
+     }
++    environ.translate_exception_poll(builder);
+ 
+     // We encode tag indices from the module directly as Cranelift
+     // `ExceptionTag`s. We will translate those to (instance,
+diff --git a/crates/environ/src/tunables.rs b/crates/environ/src/tunables.rs
+index 8e0c6f03ab88cee04ee00a7978a04ac70f29b7c6..ab79d135dc5f601bbfe4b8ce2b345b3aa8902134 100644
+--- a/crates/environ/src/tunables.rs
++++ b/crates/environ/src/tunables.rs
+@@ -28,6 +28,12 @@ macro_rules! define_tunables {
+             )*
+         }
+ 
++        impl core::hash::Hash for $tunables {
++            fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
++                $(define_tunables!(@hash $field, self.$field, state);)*
++            }
++        }
++
+         /// Optional tunable configuration options used in `wasmtime::Config`
+         #[derive(Default, Clone)]
+         #[expect(missing_docs, reason = "macro-generated fields")]
+@@ -55,11 +61,21 @@ macro_rules! define_tunables {
+             }
+         }
+     };
++    (@hash fuel_epoch_poll_interval, $value:expr, $state:ident) => {
++        // Keep legacy engine/cache identities when this extension is disabled.
++        if $value != 0 {
++            core::hash::Hash::hash("fuel_epoch_poll_interval", $state);
++            core::hash::Hash::hash(&$value, $state);
++        }
++    };
++    (@hash $field:ident, $value:expr, $state:ident) => {
++        core::hash::Hash::hash(&$value, $state);
++    };
+ }
+ 
+ define_tunables! {
+     /// Tunable parameters for WebAssembly compilation.
+-    #[derive(Clone, Hash, Serialize, Deserialize, Debug)]
++    #[derive(Clone, Serialize, Deserialize, Debug)]
+     pub struct Tunables {
+         /// The garbage collector implementation to use, which implies the layout of
+         /// GC objects and barriers that must be emitted in Wasm code.
+@@ -99,6 +115,12 @@ define_tunables! {
+         /// Whether or not we use epoch-based interruption.
+         pub epoch_interruption: bool,
+ 
++        /// Fuel-slice interval for internal epoch polling; zero keeps inline checks.
++        /// Serialized separately in versioned engine metadata to preserve the
++        /// legacy representation when this mode is disabled.
++        #[serde(skip)]
++        pub fuel_epoch_poll_interval: u64,
++
+         /// Whether or not linear memories are allowed to be reallocated after
+         /// initial allocation at runtime.
+         pub memory_may_move: bool,
+@@ -262,6 +284,7 @@ impl Tunables {
+             consume_fuel: false,
+             operator_cost: OperatorCostStrategy::Default,
+             epoch_interruption: false,
++            fuel_epoch_poll_interval: 0,
+             memory_may_move: true,
+             guard_before_linear_memory: true,
+             table_lazy_init: true,
+diff --git a/crates/wasmtime/src/config.rs b/crates/wasmtime/src/config.rs
+index b8635634ea217cc6d104839c723f3ecb6efc3137..4689326911807f08575210e051b945407c92c557 100644
+--- a/crates/wasmtime/src/config.rs
++++ b/crates/wasmtime/src/config.rs
+@@ -790,6 +790,33 @@ impl Config {
+         self
+     }
+ 
++    /// Schedules internal epoch checks at bounded fuel refills.
++    ///
++    /// A nonzero interval replaces epoch checks at private function entries and
++    /// loop headers with checks when the active fuel slice is refilled. Checks
++    /// remain at native or escaping entries, module startup, successful host
++    /// returns, and exception catch continuations. Stores inherit the interval
++    /// from their engine. Existing deadline callbacks, including async yields,
++    /// still run when an epoch check observes an expired deadline.
++    ///
++    /// The interval bounds fuel slices, not elapsed time: individual operations
++    /// and host calls have variable cost, and a straight-line block can exceed
++    /// a slice before reaching the next fuel checkpoint. Total fuel accounting
++    /// and exhaustion behavior are unchanged.
++    ///
++    /// Zero (the default) retains ordinary epoch instrumentation and the legacy
++    /// compiled-artifact format. Nonzero intervals require matching producer and
++    /// consumer configuration; older runtimes reject these artifacts.
++    ///
++    /// This mode requires fuel consumption, epoch interruption, and default
++    /// operator costs. This mode supports core modules. Components, stack
++    /// switching, shared-memory threads, guest debugging, recording, and
++    /// separately configured async fuel yields are not supported.
++    pub fn fuel_epoch_poll_interval(&mut self, interval: u64) -> &mut Self {
++        self.tunables.fuel_epoch_poll_interval = Some(interval);
++        self
++    }
++
+     /// XXX: For internal fuzzing and debugging use only!
+     #[doc(hidden)]
+     pub fn gc_zeal_alloc_counter(&mut self, counter: Option<NonZeroU32>) -> Result<&mut Self> {
+@@ -2726,6 +2753,41 @@ impl Config {
+         }
+ 
+         self.tunables.configure(&mut tunables);
++        if tunables.fuel_epoch_poll_interval != 0 {
++            crate::ensure!(
++                tunables.consume_fuel && tunables.epoch_interruption,
++                "fuel-scheduled epoch polling requires fuel and epoch instrumentation"
++            );
++            crate::ensure!(
++                matches!(
++                    tunables.operator_cost,
++                    wasmtime_environ::OperatorCostStrategy::Default
++                ),
++                "fuel-scheduled epoch polling requires default operator costs"
++            );
++            crate::ensure!(
++                !features.contains(WasmFeatures::STACK_SWITCHING),
++                "fuel-scheduled epoch polling does not support stack switching"
++            );
++            crate::ensure!(
++                !features.contains(WasmFeatures::THREADS),
++                "fuel-scheduled epoch polling does not support shared-memory threads"
++            );
++            // Component lowerings use separate host-call trampolines. They do
++            // not yet provide the continuation checks required by this mode.
++            crate::ensure!(
++                !features.contains(WasmFeatures::COMPONENT_MODEL),
++                "fuel-scheduled epoch polling does not support components"
++            );
++            crate::ensure!(
++                !tunables.debug_guest,
++                "fuel-scheduled epoch polling does not support guest debugging"
++            );
++            crate::ensure!(
++                !tunables.concurrency_support && !tunables.recording,
++                "fuel-scheduled epoch polling does not support component concurrency or recording"
++            );
++        }
+ 
+         // If no GC heap tunables are explicitly configured, copy the memory
+         // tunables' configured values so that GC heaps default to the same
+diff --git a/crates/wasmtime/src/engine/serialization.rs b/crates/wasmtime/src/engine/serialization.rs
+index b335db1cca8c9000ecccd3c8e1244449be714aae..afeee8bf30ef299f04ea6b05b30d4001d96c3072 100644
+--- a/crates/wasmtime/src/engine/serialization.rs
++++ b/crates/wasmtime/src/engine/serialization.rs
+@@ -12,10 +12,11 @@
+ //! Wasmtime AOT artifacts are ELF files so the data for the engine here is
+ //! stored into a section of the output file. The structure of this section is:
+ //!
+-//! 1. A version byte, currently `VERSION`.
++//! 1. A version byte identifying the metadata layout.
+ //! 2. A byte indicating how long the next field is.
+ //! 3. A version string of the length of the previous byte value.
+-//! 4. A `postcard`-encoded `Metadata` structure.
++//! 4. A `postcard`-encoded `Metadata` structure, followed by a nonzero fuel
++//!    interval for `FUEL_EPOCH_POLLING_VERSION`.
+ //!
+ //! This is hoped to help distinguish easily Wasmtime-based ELF files from
+ //! other random ELF files, as well as provide better error messages for
+@@ -36,7 +37,10 @@ use object::{
+ use serde_derive::{Deserialize, Serialize};
+ use wasmtime_environ::{FlagValue, ObjectKind, OperatorCostStrategy, Tunables, obj};
+ 
+-const VERSION: u8 = 0;
++const LEGACY_VERSION: u8 = 0;
++// Older runtimes must reject artifacts that omit internal epoch checks, even
++// when the embedder disables the module version string check.
++const FUEL_EPOCH_POLLING_VERSION: u8 = 1;
+ 
+ /// Verifies that the serialized engine in `mmap` is compatible with the
+ /// `engine` provided.
+@@ -102,7 +106,7 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
+     let (first, data) = data
+         .split_first()
+         .ok_or_else(|| format_err!("invalid engine section"))?;
+-    if *first != VERSION {
++    if !matches!(*first, LEGACY_VERSION | FUEL_EPOCH_POLLING_VERSION) {
+         bail!("mismatched version in engine section");
+     }
+     let (len, data) = data
+@@ -124,7 +128,20 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
+             }
+         }
+     }
+-    postcard::from_bytes::<Metadata<'_>>(data)?.check_compatible(engine)
++    let (mut metadata, remaining) = postcard::take_from_bytes::<Metadata<'_>>(data)?;
++    let remaining = if *first == FUEL_EPOCH_POLLING_VERSION {
++        let (interval, remaining) = postcard::take_from_bytes::<u64>(remaining)?;
++        ensure!(
++            interval != 0,
++            "fuel-scheduled epoch polling interval must be nonzero"
++        );
++        metadata.tunables.fuel_epoch_poll_interval = interval;
++        remaining
++    } else {
++        remaining
++    };
++    ensure!(remaining.is_empty(), "unexpected trailing engine metadata");
++    metadata.check_compatible(engine)
+ }
+ 
+ #[cfg(any(feature = "cranelift", feature = "winch"))]
+@@ -135,7 +152,12 @@ pub fn append_compiler_info(engine: &Engine, obj: &mut Object<'_>, metadata: &Me
+         object::SectionKind::ReadOnlyData,
+     );
+     let mut data = Vec::new();
+-    data.push(VERSION);
++    let interval = metadata.tunables.fuel_epoch_poll_interval;
++    data.push(if interval == 0 {
++        LEGACY_VERSION
++    } else {
++        FUEL_EPOCH_POLLING_VERSION
++    });
+     let version = engine.config().module_version.as_str();
+     // This precondition is checked in Config::module_version:
+     assert!(
+@@ -145,6 +167,9 @@ pub fn append_compiler_info(engine: &Engine, obj: &mut Object<'_>, metadata: &Me
+     data.push(version.len() as u8);
+     data.extend_from_slice(version.as_bytes());
+     data.extend(postcard::to_allocvec(metadata).unwrap());
++    if interval != 0 {
++        data.extend(postcard::to_allocvec(&interval).unwrap());
++    }
+     obj.set_section_data(section, data, 1);
+ }
+ 
+@@ -303,6 +328,7 @@ impl Metadata<'_> {
+             consume_fuel,
+             ref operator_cost,
+             epoch_interruption,
++            fuel_epoch_poll_interval,
+             memory_may_move,
+             guard_before_linear_memory,
+             table_lazy_init,
+@@ -375,6 +401,11 @@ impl Metadata<'_> {
+         )?;
+         Self::check_bool(consume_fuel, other.consume_fuel, "fuel support")?;
+         Self::check_cost(consume_fuel, operator_cost, &other.operator_cost)?;
++        Self::check_int(
++            fuel_epoch_poll_interval,
++            other.fuel_epoch_poll_interval,
++            "fuel-scheduled epoch polling interval",
++        )?;
+         Self::check_bool(
+             epoch_interruption,
+             other.epoch_interruption,
+diff --git a/crates/wasmtime/src/runtime/store.rs b/crates/wasmtime/src/runtime/store.rs
+index a0816548b8448013353d6c98eed3a6e78780a4d0..8784dbe0c5db801049dfb8ddbb381247e135b5fe 100644
+--- a/crates/wasmtime/src/runtime/store.rs
++++ b/crates/wasmtime/src/runtime/store.rs
+@@ -495,6 +495,7 @@ pub struct StoreOpaque {
+     // until the reserve is empty.
+     fuel_reserve: u64,
+     pub(crate) fuel_yield_interval: Option<NonZeroU64>,
++    pub(crate) fuel_epoch_poll_interval: Option<NonZeroU64>,
+     /// Indexed data within this `Store`, used to store information about
+     /// globals, functions, memories, etc.
+     store_data: StoreData,
+@@ -748,6 +749,7 @@ impl<T> Store<T> {
+             async_state: Default::default(),
+             fuel_reserve: 0,
+             fuel_yield_interval: None,
++            fuel_epoch_poll_interval: NonZeroU64::new(engine.tunables().fuel_epoch_poll_interval),
+             store_data,
+             traitobj: StorePtr(None),
+             default_caller_vmctx: SendSyncPtr::new(NonNull::dangling()),
+@@ -1888,7 +1890,7 @@ impl StoreOpaque {
+         refuel(
+             injected_fuel,
+             &mut self.fuel_reserve,
+-            self.fuel_yield_interval,
++            self.fuel_yield_interval.or(self.fuel_epoch_poll_interval),
+         )
+     }
+ 
+@@ -1901,7 +1903,7 @@ impl StoreOpaque {
+         set_fuel(
+             injected_fuel,
+             &mut self.fuel_reserve,
+-            self.fuel_yield_interval,
++            self.fuel_yield_interval.or(self.fuel_epoch_poll_interval),
+             fuel,
+         );
+         Ok(())
+@@ -1918,6 +1920,11 @@ impl StoreOpaque {
+             "fuel_async_yield_interval must not be 0"
+         );
+ 
++        crate::ensure!(
++            interval.is_none() || self.fuel_epoch_poll_interval.is_none(),
++            "async fuel yields do not combine with fuel-scheduled epoch polling"
++        );
++
+         // All future entrypoints must be async to handle the case that fuel
+         // runs out and an async yield is needed.
+         self.set_async_required(Asyncness::Yes);
+diff --git a/crates/wasmtime/src/runtime/vm/libcalls.rs b/crates/wasmtime/src/runtime/vm/libcalls.rs
+index 157cf8095b9d15d5d4ddf2521cba5d3459c6f336..cc234ec1a499cd32547a6792ac4e88bc1fc8cfea 100644
+--- a/crates/wasmtime/src/runtime/vm/libcalls.rs
++++ b/crates/wasmtime/src/runtime/vm/libcalls.rs
+@@ -725,17 +725,25 @@ fn memory_atomic_wait64(
+ }
+ 
+ // Hook for when an instance runs out of fuel.
+-fn out_of_gas(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
++fn out_of_gas(store: &mut dyn VMStore, instance: InstanceId) -> Result<()> {
+     block_on!(store, async |store, _| {
+         if !store.refuel() {
+-            return Err(Trap::OutOfFuel.into());
++            return Err::<(), crate::Error>(Trap::OutOfFuel.into());
+         }
+         #[cfg(feature = "async")]
+         if store.fuel_yield_interval.is_some() {
+             store.yield_now().await;
+         }
+         Ok(())
+-    })?
++    })??;
++    #[cfg(target_has_atomic = "64")]
++    if store.fuel_epoch_poll_interval.is_some() {
++        let now = store.engine().current_epoch();
++        if now >= store.get_epoch_deadline() {
++            new_epoch(store, instance)?;
++        }
++    }
++    Ok(())
+ }
+ 
+ // Hook for when an instance observes that the epoch has changed.
+diff --git a/tests/all/main.rs b/tests/all/main.rs
+index 33448abe9279723cd1bb538102a2581d62cc5a94..08b1b2a6395cb53b1b60ab9d951219d0ca693640 100644
+--- a/tests/all/main.rs
++++ b/tests/all/main.rs
+@@ -39,6 +39,7 @@ mod limits;
+ mod linker;
+ mod memory;
+ mod memory_creator;
++mod metering_polling;
+ mod missing_async;
+ mod module;
+ mod module_serialize;
+diff --git a/tests/all/metering_polling.rs b/tests/all/metering_polling.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea7e0c7d2e236e87b2c25a94751ec28c9c0bf14a
+--- /dev/null
++++ b/tests/all/metering_polling.rs
+@@ -0,0 +1,1122 @@
++#![cfg(all(not(miri), feature = "cranelift", feature = "gc"))]
++
++use std::{
++    borrow::Cow,
++    future::Future,
++    task::{Context, Poll, Waker},
++};
++use wasm_encoder::{
++    BlockType, Catch, CodeSection, EntityType, ExportKind, ExportSection, Function,
++    FunctionSection, ImportSection, Instruction as I, Module as EncodedModule, TagKind, TagSection,
++    TagType, TypeSection, ValType,
++};
++use wasmtime::{
++    Config, Engine, Error, Inlining, Instance, Linker, Module, Store, Trap, UpdateDeadline, V128,
++};
++
++fn engine() -> Engine {
++    let mut config = Config::new();
++    #[cfg(feature = "gc-copying")]
++    config.collector(wasmtime::Collector::Copying);
++    config
++        .consume_fuel(true)
++        .epoch_interruption(true)
++        .compiler_inlining(Inlining::No)
++        .wasm_exceptions(true);
++    Engine::new(&config).unwrap()
++}
++
++fn finish<T>(future: impl Future<Output = T>) -> (T, usize) {
++    let mut future = std::pin::pin!(future);
++    let mut context = Context::from_waker(Waker::noop());
++    for polls in 1..10_000 {
++        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
++            return (value, polls);
++        }
++    }
++    panic!("metered invocation did not finish");
++}
++
++fn register_module() -> Vec<u8> {
++    let mut m = EncodedModule::new();
++    let mut types = TypeSection::new();
++    types.ty().function(
++        [
++            ValType::I32,
++            ValType::F64,
++            ValType::F64,
++            ValType::I64,
++            ValType::I64,
++            ValType::V128,
++        ],
++        [ValType::I64, ValType::F64, ValType::V128],
++    );
++    m.section(&types);
++    let mut functions = FunctionSection::new();
++    functions.function(0);
++    m.section(&functions);
++    let mut exports = ExportSection::new();
++    exports.export("mixed", ExportKind::Func, 0);
++    m.section(&exports);
++    let mut f = Function::new([]);
++    for i in [
++        I::Block(BlockType::Empty),
++        I::Loop(BlockType::Empty),
++        I::LocalGet(0),
++        I::I32Eqz,
++        I::BrIf(1),
++        I::LocalGet(1),
++        I::LocalGet(2),
++        I::F64Add,
++        I::LocalSet(1),
++        I::LocalGet(3),
++        I::LocalGet(4),
++        I::I64Xor,
++        I::LocalSet(3),
++        I::LocalGet(5),
++        I::I32Const(7),
++        I::I8x16Splat,
++        I::I8x16Add,
++        I::LocalSet(5),
++        I::LocalGet(0),
++        I::I32Const(1),
++        I::I32Sub,
++        I::LocalSet(0),
++        I::Br(0),
++        I::End,
++        I::End,
++        I::LocalGet(3),
++        I::LocalGet(1),
++        I::LocalGet(5),
++        I::End,
++    ] {
++        f.instruction(&i);
++    }
++    let mut code = CodeSection::new();
++    code.function(&f);
++    m.section(&code);
++    m.finish()
++}
++
++fn exception_module() -> Vec<u8> {
++    let mut m = EncodedModule::new();
++    let mut t = TypeSection::new();
++    t.ty().function([ValType::I64], []);
++    t.ty().function([ValType::I64], [ValType::I64]);
++    t.ty().function([], []);
++    m.section(&t);
++    let mut imports = ImportSection::new();
++    imports.import("host", "tick", EntityType::Function(2));
++    m.section(&imports);
++    let mut f = FunctionSection::new();
++    f.function(1).function(1);
++    m.section(&f);
++    let mut tags = TagSection::new();
++    tags.tag(TagType {
++        kind: TagKind::Exception,
++        func_type_idx: 0,
++    });
++    m.section(&tags);
++    let mut e = ExportSection::new();
++    e.export("caught", ExportKind::Func, 1);
++    m.section(&e);
++    let mut c = CodeSection::new();
++    let mut run = Function::new([]);
++    for i in [
++        I::Block(BlockType::Result(ValType::I64)),
++        I::TryTable(
++            BlockType::Result(ValType::I64),
++            Cow::Owned(vec![Catch::One { tag: 0, label: 0 }]),
++        ),
++        I::Call(0),
++        I::LocalGet(0),
++        I::Call(2),
++        I::End,
++        I::End,
++        I::End,
++    ] {
++        run.instruction(&i);
++    }
++    c.function(&run);
++    let mut throwing = Function::new([]);
++    for i in [I::LocalGet(0), I::Throw(0), I::End] {
++        throwing.instruction(&i);
++    }
++    c.function(&throwing);
++    m.section(&c);
++    m.finish()
++}
++
++#[test]
++fn live_values_across_fuel_refills_and_epoch_updates() {
++    let engine = engine();
++    let module = Module::new(&engine, register_module()).unwrap();
++    let vector = 0x0102030405060708090a0b0c0d0e0f10_u128;
++    let expected_vector =
++        u128::from_le_bytes(vector.to_le_bytes().map(|lane| lane.wrapping_add(13 * 7)));
++    for interval in [None, Some(1), Some(7), Some(31)] {
++        for mode in [0, 1, 2, 3] {
++            for fuel in [0, 1, 19, 127, 4096] {
++                let mut store = Store::new(&engine, 0_u32);
++                let instance = Instance::new(&mut store, &module, &[]).unwrap();
++                store.set_fuel(fuel).unwrap();
++                if let Some(interval) = interval {
++                    store.fuel_async_yield_interval(Some(interval)).unwrap();
++                }
++                store.set_epoch_deadline(if mode == 0 { 1 } else { 0 });
++                store.epoch_deadline_callback(move |mut context| {
++                    *context.data_mut() += 1;
++                    Ok(match mode {
++                        1 => UpdateDeadline::Continue(0),
++                        2 => UpdateDeadline::Yield(0),
++                        _ => UpdateDeadline::Continue(1),
++                    })
++                });
++                let run = instance
++                    .get_typed_func::<(i32, f64, f64, i64, i64, V128), (i64, f64, V128)>(
++                        &mut store, "mixed",
++                    )
++                    .unwrap();
++                let (result, polls) = finish(run.call_async(
++                    &mut store,
++                    (
++                        13,
++                        1.25,
++                        0.5,
++                        0x1234567890,
++                        0x1020304050,
++                        V128::from(vector),
++                    ),
++                ));
++                if fuel < 280 {
++                    assert_eq!(
++                        result.unwrap_err().downcast_ref::<Trap>(),
++                        Some(&Trap::OutOfFuel)
++                    );
++                    assert_eq!(store.get_fuel().unwrap(), 0);
++                    continue;
++                }
++                let (integer, float, vector) = result.unwrap();
++                assert_eq!(integer, 0x1234567890 ^ 0x1020304050);
++                assert_eq!(float, 1.25 + 13.0 * 0.5);
++                assert_eq!(vector.as_u128(), expected_vector);
++                assert_eq!(store.get_fuel().unwrap(), fuel - 280);
++                assert_eq!(polls > 1, interval.is_some() || mode == 2);
++                match mode {
++                    0 => assert_eq!(*store.data(), 0),
++                    3 => assert_eq!(*store.data(), 1),
++                    _ => assert!(*store.data() > 1),
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn metering_traps_do_not_become_wasm_exceptions() {
++    let engine = engine();
++    let module = Module::new(&engine, exception_module()).unwrap();
++    let mut linker = Linker::new(&engine);
++    let tick = engine.clone();
++    linker
++        .func_wrap("host", "tick", move || {
++            tick.increment_epoch();
++        })
++        .unwrap();
++    for mode in 0..3 {
++        for fuel in [0, 1, 7, 32, 1000] {
++            let mut store = Store::new(&engine, 0_u32);
++            let instance = linker.instantiate(&mut store, &module).unwrap();
++            store.set_fuel(fuel).unwrap();
++            store.set_epoch_deadline(1);
++            store.epoch_deadline_callback(move |mut context| {
++                *context.data_mut() += 1;
++                match mode {
++                    0 => Ok(UpdateDeadline::Continue(1)),
++                    1 => Ok(UpdateDeadline::Interrupt),
++                    _ => Err(Error::msg("epoch callback stop")),
++                }
++            });
++            let run = instance
++                .get_typed_func::<i64, i64>(&mut store, "caught")
++                .unwrap();
++            match run.call(&mut store, 0x1234_5678) {
++                Ok(value) => {
++                    assert_eq!(mode, 0);
++                    assert_eq!(value, 0x1234_5678);
++                }
++                Err(error) => match error.downcast_ref::<Trap>() {
++                    Some(Trap::OutOfFuel) => assert!(fuel < 1000),
++                    Some(Trap::Interrupt) => assert_eq!(mode, 1),
++                    None => {
++                        assert_eq!(mode, 2);
++                        assert_eq!(error.root_cause().to_string(), "epoch callback stop");
++                    }
++                    trap => panic!("unexpected trap: {trap:?}"),
++                },
++            }
++            assert!(!store.has_pending_exception());
++            if fuel == 1000 {
++                assert_eq!(*store.data(), 1);
++            }
++        }
++    }
++}
++
++#[test]
++fn cancelled_fuel_yield_leaves_store_usable() {
++    let engine = engine();
++    let module = Module::new(&engine, register_module()).unwrap();
++    let mut store = Store::new(&engine, ());
++    let instance = Instance::new(&mut store, &module, &[]).unwrap();
++    store.set_fuel(1_000_000).unwrap();
++    store.set_epoch_deadline(1);
++    store.fuel_async_yield_interval(Some(1)).unwrap();
++    let run = instance
++        .get_typed_func::<(i32, f64, f64, i64, i64, V128), (i64, f64, V128)>(&mut store, "mixed")
++        .unwrap();
++    {
++        let mut future =
++            std::pin::pin!(run.call_async(&mut store, (1_000_000, 1.0, 2.0, 3, 4, V128::from(0))));
++        let mut context = Context::from_waker(Waker::noop());
++        for _ in 0..32 {
++            assert!(future.as_mut().poll(&mut context).is_pending());
++        }
++    }
++    assert!(store.get_fuel().unwrap() < 1_000_000);
++    store.fuel_async_yield_interval(None).unwrap();
++    store.set_fuel(1000).unwrap();
++    // Once fuel yielding has been enabled, this Store requires async entrypoints
++    // even after its interval has been disabled.
++    let (result, polls) = finish(run.call_async(&mut store, (1, 1.0, 2.0, 3, 4, V128::from(0))));
++    let (integer, float, vector) = result.unwrap();
++    assert_eq!(integer, 7);
++    assert_eq!(float, 3.0);
++    assert_eq!(vector.as_u128(), u128::from_le_bytes([7; 16]));
++    assert_eq!(polls, 1);
++}
++
++fn exception_fuel_module(iterations: i32, depth: u32, throws: bool, catch: Catch) -> Vec<u8> {
++    let mut module = EncodedModule::new();
++    let mut types = TypeSection::new();
++    types.ty().function([], []);
++    types.ty().function([], [ValType::I32]);
++    module.section(&types);
++    let mut functions = FunctionSection::new();
++    for _ in 0..=depth {
++        functions.function(0);
++    }
++    functions.function(1);
++    module.section(&functions);
++    let mut tags = TagSection::new();
++    tags.tag(TagType {
++        kind: TagKind::Exception,
++        func_type_idx: 0,
++    });
++    module.section(&tags);
++    let mut exports = ExportSection::new();
++    exports.export("run", ExportKind::Func, depth + 1);
++    module.section(&exports);
++    let mut code = CodeSection::new();
++    let mut leaf = Function::new([(1, ValType::I32)]);
++    for op in [
++        I::I32Const(iterations),
++        I::LocalSet(0),
++        I::Loop(BlockType::Empty),
++        I::LocalGet(0),
++        I::I32Const(1),
++        I::I32Sub,
++        I::LocalTee(0),
++        I::BrIf(0),
++        I::End,
++    ] {
++        leaf.instruction(&op);
++    }
++    if throws {
++        leaf.instruction(&I::Throw(0));
++    }
++    leaf.instruction(&I::End);
++    code.function(&leaf);
++    let retains_ref = matches!(catch, Catch::OneRef { .. } | Catch::AllRef { .. });
++    let block_type = if retains_ref {
++        BlockType::Result(ValType::EXNREF)
++    } else {
++        BlockType::Empty
++    };
++    for index in 1..=depth + 1 {
++        let mut caller = Function::new([]);
++        caller
++            .instruction(&I::Block(block_type))
++            .instruction(&I::TryTable(block_type, Cow::Owned(vec![catch.clone()])))
++            .instruction(&I::Call(index - 1));
++        // Return directly on the normal path; only the caught path below
++        // consumes the exception reference or rethrows it.
++        if index == depth + 1 {
++            caller.instruction(&I::I32Const(42));
++        }
++        caller
++            .instruction(&I::Return)
++            .instruction(&I::End)
++            .instruction(&I::End);
++        if index == depth + 1 {
++            if retains_ref {
++                caller.instruction(&I::Drop);
++            }
++            caller.instruction(&I::I32Const(42));
++        } else {
++            caller.instruction(&if retains_ref {
++                I::ThrowRef
++            } else {
++                I::Throw(0)
++            });
++        }
++        caller.instruction(&I::End);
++        code.function(&caller);
++    }
++    module.section(&code);
++    module.finish()
++}
++
++#[test]
++fn caught_exceptions_retain_callee_fuel_across_refills() {
++    let engine = engine();
++    for iterations in [10, 1_000] {
++        for depth in [0, 2] {
++            for catch in [
++                Catch::All { label: 0 },
++                Catch::One { tag: 0, label: 0 },
++                Catch::AllRef { label: 0 },
++                Catch::OneRef { tag: 0, label: 0 },
++            ] {
++                for throws in [false, true] {
++                    let module = Module::new(
++                        &engine,
++                        exception_fuel_module(iterations, depth, throws, catch.clone()),
++                    )
++                    .unwrap();
++                    // Each loop iteration costs five units. The two initial
++                    // local operations, entries, calls, try_tables, constants
++                    // and optional throws supply the remaining fixed charge.
++                    let expected = 5 * iterations as u64
++                        + 7
++                        + u64::from(throws)
++                        + u64::from(depth) * if throws { 4 } else { 3 };
++                    for interval in [None, Some(1), Some(100), Some(1_000), Some(100_000)] {
++                        let mut store = Store::new(&engine, ());
++                        store.set_fuel(1_000_000).unwrap();
++                        store.set_epoch_deadline(1);
++                        let instance = Instance::new(&mut store, &module, &[]).unwrap();
++                        if interval.is_some() {
++                            store.fuel_async_yield_interval(interval).unwrap();
++                        }
++                        let run = instance
++                            .get_typed_func::<(), i32>(&mut store, "run")
++                            .unwrap();
++                        let (result, _) = finish(run.call_async(&mut store, ()));
++                        assert_eq!(result.unwrap(), 42);
++                        assert_eq!(
++                            1_000_000 - store.get_fuel().unwrap(),
++                            expected,
++                            "iterations={iterations} depth={depth} throws={throws} interval={interval:?} catch={catch:?}"
++                        );
++                        assert!(!store.has_pending_exception());
++                    }
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn caught_exceptions_do_not_restore_exhausted_fuel() {
++    let engine = engine();
++    let module = Module::new(
++        &engine,
++        exception_fuel_module(100, 2, true, Catch::AllRef { label: 0 }),
++    )
++    .unwrap();
++    for interval in [None, Some(1), Some(31)] {
++        for fuel in [0, 1, 100, 503, 507, 512] {
++            let mut store = Store::new(&engine, ());
++            store.set_fuel(fuel).unwrap();
++            store.set_epoch_deadline(1);
++            let instance = Instance::new(&mut store, &module, &[]).unwrap();
++            if interval.is_some() {
++                store.fuel_async_yield_interval(interval).unwrap();
++            }
++            let run = instance
++                .get_typed_func::<(), i32>(&mut store, "run")
++                .unwrap();
++            let (result, _) = finish(run.call_async(&mut store, ()));
++            // Entry/loop checkpoints may leave the final straight-line charge
++            // until the next call. Either result must leave the budget spent.
++            if let Err(error) = result {
++                assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::OutOfFuel));
++            }
++            assert_eq!(
++                store.get_fuel().unwrap(),
++                0,
++                "fuel={fuel} interval={interval:?}"
++            );
++            let (result, _) = finish(run.call_async(&mut store, ()));
++            assert_eq!(
++                result.unwrap_err().downcast_ref::<Trap>(),
++                Some(&Trap::OutOfFuel)
++            );
++            assert!(!store.has_pending_exception());
++        }
++    }
++}
++
++fn polling_config(interval: u64) -> Config {
++    let mut config = Config::new();
++    #[cfg(feature = "gc-copying")]
++    config.collector(wasmtime::Collector::Copying);
++    config
++        .consume_fuel(true)
++        .epoch_interruption(true)
++        .wasm_exceptions(true)
++        .compiler_inlining(Inlining::No)
++        .fuel_epoch_poll_interval(interval)
++        .concurrency_support(false);
++    #[cfg(feature = "threads")]
++    config.wasm_threads(false);
++    #[cfg(feature = "component-model")]
++    config.wasm_component_model(false);
++    config
++}
++
++fn polling_engine(interval: u64) -> Engine {
++    Engine::new(&polling_config(interval)).unwrap()
++}
++
++fn host_return_module() -> Vec<u8> {
++    let mut m = EncodedModule::new();
++    let mut types = TypeSection::new();
++    types.ty().function([], []);
++    types.ty().function([], [ValType::I32]);
++    m.section(&types);
++    let mut imports = ImportSection::new();
++    imports.import("host", "tick", EntityType::Function(0));
++    m.section(&imports);
++    let mut functions = FunctionSection::new();
++    functions.function(1).function(1);
++    m.section(&functions);
++    let mut exports = ExportSection::new();
++    exports
++        .export("run", ExportKind::Func, 1)
++        .export("reenter", ExportKind::Func, 2);
++    m.section(&exports);
++    let mut code = CodeSection::new();
++    let mut run = Function::new([]);
++    run.instruction(&I::Call(0))
++        .instruction(&I::I32Const(42))
++        .instruction(&I::End);
++    code.function(&run);
++    let mut reenter = Function::new([]);
++    reenter.instruction(&I::I32Const(43)).instruction(&I::End);
++    code.function(&reenter);
++    m.section(&code);
++    m.finish()
++}
++
++fn call_tree_module(depth: u32, start: bool) -> Vec<u8> {
++    let mut m = EncodedModule::new();
++    let mut types = TypeSection::new();
++    types.ty().function([], []);
++    m.section(&types);
++    let mut functions = FunctionSection::new();
++    for _ in 0..=depth {
++        functions.function(0);
++    }
++    m.section(&functions);
++    let mut exports = ExportSection::new();
++    exports.export("run", ExportKind::Func, depth);
++    m.section(&exports);
++    if start {
++        m.section(&wasm_encoder::StartSection {
++            function_index: depth,
++        });
++    }
++    let mut code = CodeSection::new();
++    for index in 0..=depth {
++        let mut f = Function::new([]);
++        if index > 0 {
++            f.instruction(&I::Call(index - 1))
++                .instruction(&I::Call(index - 1));
++        }
++        f.instruction(&I::End);
++        code.function(&f);
++    }
++    m.section(&code);
++    m.finish()
++}
++
++#[test]
++fn polling_contract_rejects_incompatible_artifacts_and_options() {
++    let candidate = polling_engine(100);
++    let bytes = candidate
++        .precompile_module(&call_tree_module(1, false))
++        .unwrap();
++    for interval in [0, 101] {
++        let engine = polling_engine(interval);
++        let error = unsafe { Module::deserialize(&engine, &bytes) }.unwrap_err();
++        assert!(
++            error
++                .to_string()
++                .contains("fuel-scheduled epoch polling interval"),
++            "{error:#}"
++        );
++    }
++    let matching = polling_engine(100);
++    unsafe { Module::deserialize(&matching, &bytes) }.unwrap();
++    for (fuel, epochs) in [(false, true), (true, false), (false, false)] {
++        let mut config = polling_config(100);
++        config
++            .consume_fuel(fuel)
++            .epoch_interruption(epochs)
++            .fuel_epoch_poll_interval(100);
++        assert!(Engine::new(&config).is_err());
++    }
++    let mut config = polling_config(100);
++    config
++        .consume_fuel(true)
++        .epoch_interruption(true)
++        .fuel_epoch_poll_interval(100)
++        .operator_cost(wasmtime::OperatorCost::new());
++    assert!(Engine::new(&config).is_err());
++    let mut store = Store::new(&candidate, ());
++    store.set_fuel(10_000).unwrap();
++    assert!(store.fuel_async_yield_interval(Some(10)).is_err());
++    assert_eq!(store.get_fuel().unwrap(), 10_000);
++}
++
++#[test]
++fn polling_artifact_identity_and_metadata_versions() {
++    use object::{Object, ObjectSection};
++    use std::hash::{DefaultHasher, Hash, Hasher};
++
++    let mut identities = Vec::new();
++    for interval in [0, 100, 101] {
++        let engine = polling_engine(interval);
++        let mut hash = DefaultHasher::new();
++        engine.precompile_compatibility_hash().hash(&mut hash);
++        identities.push(hash.finish());
++        let mut artifact = engine
++            .precompile_module(&call_tree_module(1, false))
++            .unwrap();
++        let object = object::File::parse(&*artifact).unwrap();
++        let section = object.section_by_name(".wasmtime.engine").unwrap();
++        let (offset, len) = section.file_range().unwrap();
++        let offset = usize::try_from(offset).unwrap();
++        let len = usize::try_from(len).unwrap();
++        assert_eq!(artifact[offset], u8::from(interval != 0));
++        if interval != 0 {
++            // These intervals fit in one postcard byte. A zero extension must
++            // not turn an artifact without internal checks into a legacy one.
++            assert_eq!(artifact[offset + len - 1], interval as u8);
++            artifact[offset + len - 1] = 0;
++            let mut config = polling_config(0);
++            config
++                .module_version(wasmtime::ModuleVersionStrategy::None)
++                .unwrap();
++            let consumer = Engine::new(&config).unwrap();
++            let error = unsafe { Module::deserialize(&consumer, &artifact) }.unwrap_err();
++            assert!(
++                error.to_string().contains("interval must be nonzero"),
++                "{error:#}"
++            );
++        }
++    }
++    assert_ne!(identities[0], identities[1]);
++    assert_ne!(identities[0], identities[2]);
++    assert_ne!(identities[1], identities[2]);
++
++    // Explicitly disabling the mode must retain the ordinary engine identity.
++    let mut config = Config::new();
++    #[cfg(feature = "gc-copying")]
++    config.collector(wasmtime::Collector::Copying);
++    config
++        .consume_fuel(true)
++        .epoch_interruption(true)
++        .wasm_exceptions(true)
++        .compiler_inlining(Inlining::No)
++        .concurrency_support(false);
++    #[cfg(feature = "threads")]
++    config.wasm_threads(false);
++    #[cfg(feature = "component-model")]
++    config.wasm_component_model(false);
++    let default = Engine::new(&config).unwrap();
++    let mut hash = DefaultHasher::new();
++    default.precompile_compatibility_hash().hash(&mut hash);
++    assert_eq!(hash.finish(), identities[0]);
++}
++
++#[test]
++fn polling_rejects_unsupported_execution_modes() {
++    let mut config = polling_config(100);
++    config.wasm_stack_switching(true);
++    assert!(
++        Engine::new(&config)
++            .unwrap_err()
++            .to_string()
++            .contains("does not support stack switching")
++    );
++
++    let mut config = polling_config(100);
++    config.concurrency_support(true);
++    assert!(
++        Engine::new(&config)
++            .unwrap_err()
++            .to_string()
++            .contains("does not support component concurrency")
++    );
++
++    #[cfg(feature = "threads")]
++    {
++        let mut config = polling_config(100);
++        config.wasm_threads(true);
++        assert!(
++            Engine::new(&config)
++                .unwrap_err()
++                .to_string()
++                .contains("does not support shared-memory threads")
++        );
++    }
++    #[cfg(feature = "component-model")]
++    {
++        let mut config = polling_config(100);
++        config.wasm_component_model(true);
++        assert!(
++            Engine::new(&config)
++                .unwrap_err()
++                .to_string()
++                .contains("does not support components")
++        );
++    }
++    #[cfg(feature = "debug")]
++    {
++        let mut config = polling_config(100);
++        config.guest_debug(true);
++        assert!(
++            Engine::new(&config)
++                .unwrap_err()
++                .to_string()
++                .contains("does not support guest debugging")
++        );
++    }
++}
++
++#[test]
++fn polling_stores_preserve_fuel_and_exception_charges() {
++    for interval in [1, 7, 100, 100_000] {
++        let engine = polling_engine(interval);
++        for catch in [
++            Catch::All { label: 0 },
++            Catch::One { tag: 0, label: 0 },
++            Catch::AllRef { label: 0 },
++            Catch::OneRef { tag: 0, label: 0 },
++        ] {
++            let module = Module::new(&engine, exception_fuel_module(100, 2, true, catch)).unwrap();
++            let mut store = Store::new(&engine, ());
++            store.set_fuel(10_000).unwrap();
++            store.set_epoch_deadline(1);
++            let instance = Instance::new(&mut store, &module, &[]).unwrap();
++            let run = instance
++                .get_typed_func::<(), i32>(&mut store, "run")
++                .unwrap();
++            assert_eq!(run.call(&mut store, ()).unwrap(), 42);
++            assert_eq!(store.get_fuel().unwrap(), 10_000 - 516);
++            store.set_fuel(512).unwrap();
++            let first = run.call(&mut store, ());
++            if let Err(error) = first {
++                assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::OutOfFuel));
++            }
++            assert_eq!(store.get_fuel().unwrap(), 0);
++            assert_eq!(
++                run.call(&mut store, ()).unwrap_err().downcast_ref::<Trap>(),
++                Some(&Trap::OutOfFuel)
++            );
++        }
++    }
++}
++
++#[test]
++fn polling_retains_expired_native_entry_and_startup_checks() {
++    let engine = polling_engine(100_000);
++    let module = Module::new(&engine, call_tree_module(0, false)).unwrap();
++    let mut store = Store::new(&engine, ());
++    store.set_fuel(10_000).unwrap();
++    store.set_epoch_deadline(1);
++    let instance = Instance::new(&mut store, &module, &[]).unwrap();
++    let run = instance
++        .get_typed_func::<(), ()>(&mut store, "run")
++        .unwrap();
++    engine.increment_epoch();
++    assert_eq!(
++        run.call(&mut store, ()).unwrap_err().downcast_ref::<Trap>(),
++        Some(&Trap::Interrupt)
++    );
++    let startup = Module::new(&engine, call_tree_module(1, true)).unwrap();
++    assert_eq!(
++        Instance::new(&mut store, &startup, &[])
++            .unwrap_err()
++            .downcast_ref::<Trap>(),
++        Some(&Trap::Interrupt)
++    );
++}
++
++#[test]
++fn polling_handles_internal_loops_call_trees_yields_and_callback_errors() {
++    for is_tree in [false, true] {
++        for error_callback in [false, true] {
++            let engine = polling_engine(100);
++            let bytes = if is_tree {
++                call_tree_module(12, false)
++            } else {
++                exception_fuel_module(100_000, 0, false, Catch::All { label: 0 })
++            };
++            let module = Module::new(&engine, bytes).unwrap();
++            let mut store = Store::new(&engine, 0_u32);
++            store.set_fuel(1_000_000).unwrap();
++            store.set_epoch_deadline(1);
++            let instance = Instance::new(&mut store, &module, &[]).unwrap();
++            store.set_epoch_deadline(0);
++            store.epoch_deadline_callback(move |mut context| {
++                *context.data_mut() += 1;
++                if *context.data() == 3 {
++                    if error_callback {
++                        Err(Error::msg("polling callback stop"))
++                    } else {
++                        Ok(UpdateDeadline::Interrupt)
++                    }
++                } else {
++                    Ok(UpdateDeadline::Yield(0))
++                }
++            });
++            let (error, polls) = if is_tree {
++                let run = instance
++                    .get_typed_func::<(), ()>(&mut store, "run")
++                    .unwrap();
++                let (result, polls) = finish(run.call_async(&mut store, ()));
++                (result.unwrap_err(), polls)
++            } else {
++                let run = instance
++                    .get_typed_func::<(), i32>(&mut store, "run")
++                    .unwrap();
++                let (result, polls) = finish(run.call_async(&mut store, ()));
++                (result.unwrap_err(), polls)
++            };
++            assert_eq!(*store.data(), 3);
++            assert!(polls >= 3);
++            assert!((200..220).contains(&(1_000_000 - store.get_fuel().unwrap())));
++            if error_callback {
++                assert_eq!(error.root_cause().to_string(), "polling callback stop");
++            } else {
++                assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::Interrupt));
++            }
++            assert!(!store.has_pending_exception());
++        }
++    }
++}
++
++#[test]
++fn polling_checks_synchronous_host_return_and_native_reentry() {
++    for reentry in [false, true] {
++        let engine = polling_engine(100_000);
++        let module = Module::new(&engine, host_return_module()).unwrap();
++        let mut linker = Linker::new(&engine);
++        let tick = engine.clone();
++        linker
++            .func_wrap(
++                "host",
++                "tick",
++                move |mut caller: wasmtime::Caller<'_, ()>| -> Result<(), Error> {
++                    tick.increment_epoch();
++                    if reentry {
++                        let run = caller
++                            .get_export("reenter")
++                            .unwrap()
++                            .into_func()
++                            .unwrap()
++                            .typed::<(), i32>(&caller)?;
++                        run.call(&mut caller, ())?;
++                    }
++                    Ok(())
++                },
++            )
++            .unwrap();
++        let mut store = Store::new(&engine, ());
++        store.set_fuel(1_000_000).unwrap();
++        store.set_epoch_deadline(1);
++        let instance = linker.instantiate(&mut store, &module).unwrap();
++        let run = instance
++            .get_typed_func::<(), i32>(&mut store, "run")
++            .unwrap();
++        assert_eq!(
++            run.call(&mut store, ()).unwrap_err().downcast_ref::<Trap>(),
++            Some(&Trap::Interrupt)
++        );
++    }
++}
++
++#[test]
++fn polling_checks_asynchronous_host_return_and_yields() {
++    let engine = polling_engine(100_000);
++    let module = Module::new(&engine, host_return_module()).unwrap();
++    let mut linker = Linker::new(&engine);
++    let tick = engine.clone();
++    linker
++        .func_wrap_async(
++            "host",
++            "tick",
++            move |_caller: wasmtime::Caller<'_, u32>, ()| {
++                let tick = tick.clone();
++                Box::new(async move {
++                    let mut first = true;
++                    std::future::poll_fn(move |context| {
++                        if first {
++                            first = false;
++                            context.waker().wake_by_ref();
++                            Poll::Pending
++                        } else {
++                            Poll::Ready(())
++                        }
++                    })
++                    .await;
++                    tick.increment_epoch();
++                })
++            },
++        )
++        .unwrap();
++    let mut store = Store::new(&engine, 0_u32);
++    store.set_fuel(1_000_000).unwrap();
++    store.set_epoch_deadline(1);
++    store.epoch_deadline_callback(|mut context| {
++        *context.data_mut() += 1;
++        Ok(UpdateDeadline::Yield(1))
++    });
++    let (instance, _) = finish(linker.instantiate_async(&mut store, &module));
++    let instance = instance.unwrap();
++    let run = instance
++        .get_typed_func::<(), i32>(&mut store, "run")
++        .unwrap();
++    let (result, polls) = finish(run.call_async(&mut store, ()));
++    assert_eq!(result.unwrap(), 42);
++    assert_eq!(*store.data(), 1);
++    assert!(polls >= 3);
++}
++
++#[test]
++fn polling_retains_checks_for_table_only_targets() {
++    use wasm_encoder::{ConstExpr, ElementSection, Elements, RefType, TableSection, TableType};
++    let engine = polling_engine(100_000);
++    let mut m = EncodedModule::new();
++    let mut types = TypeSection::new();
++    types.ty().function([], [ValType::I32]);
++    m.section(&types);
++    let mut functions = FunctionSection::new();
++    functions.function(0);
++    m.section(&functions);
++    let mut tables = TableSection::new();
++    tables.table(TableType {
++        element_type: RefType::FUNCREF,
++        minimum: 1,
++        maximum: Some(1),
++        table64: false,
++        shared: false,
++    });
++    m.section(&tables);
++    let mut exports = ExportSection::new();
++    exports.export("targets", ExportKind::Table, 0);
++    m.section(&exports);
++    let mut elements = ElementSection::new();
++    elements.active(
++        None,
++        &ConstExpr::i32_const(0),
++        Elements::Functions(Cow::Borrowed(&[0])),
++    );
++    m.section(&elements);
++    let mut code = CodeSection::new();
++    let mut target = Function::new([]);
++    target.instruction(&I::I32Const(42)).instruction(&I::End);
++    code.function(&target);
++    m.section(&code);
++    let module = Module::new(&engine, m.finish()).unwrap();
++    let mut store = Store::new(&engine, ());
++    store.set_fuel(10_000).unwrap();
++    store.set_epoch_deadline(1);
++    let instance = Instance::new(&mut store, &module, &[]).unwrap();
++    let table = instance.get_table(&mut store, "targets").unwrap();
++    let wasmtime::Ref::Func(Some(target)) = table.get(&mut store, 0).unwrap() else {
++        panic!("missing target")
++    };
++    let target = target.typed::<(), i32>(&store).unwrap();
++    engine.increment_epoch();
++    assert_eq!(
++        target
++            .call(&mut store, ())
++            .unwrap_err()
++            .downcast_ref::<Trap>(),
++        Some(&Trap::Interrupt)
++    );
++}
++
++#[test]
++fn polling_preserves_host_reference_results_across_callback_gc() {
++    let engine = polling_engine(100_000);
++    let mut m = EncodedModule::new();
++    let mut types = TypeSection::new();
++    types.ty().function([], [ValType::EXTERNREF]);
++    m.section(&types);
++    let mut imports = ImportSection::new();
++    imports.import("host", "value", EntityType::Function(0));
++    m.section(&imports);
++    let mut functions = FunctionSection::new();
++    functions.function(0);
++    m.section(&functions);
++    let mut exports = ExportSection::new();
++    exports.export("run", ExportKind::Func, 1);
++    m.section(&exports);
++    let mut code = CodeSection::new();
++    let mut run = Function::new([]);
++    run.instruction(&I::Call(0)).instruction(&I::End);
++    code.function(&run);
++    m.section(&code);
++    let module = Module::new(&engine, m.finish()).unwrap();
++    let mut linker = Linker::new(&engine);
++    let tick = engine.clone();
++    linker.func_wrap("host", "value", move |mut caller: wasmtime::Caller<'_, u32>| -> Result<Option<wasmtime::Rooted<wasmtime::ExternRef>>, Error> {
++        let value = wasmtime::ExternRef::new(&mut caller, 42_i32)?;
++        tick.increment_epoch();
++        Ok(Some(value))
++    }).unwrap();
++    let mut store = Store::new(&engine, 0_u32);
++    store.set_fuel(1_000_000).unwrap();
++    store.set_epoch_deadline(1);
++    store.epoch_deadline_callback(|mut context| {
++        *context.data_mut() += 1;
++        context.gc(None)?;
++        Ok(UpdateDeadline::Continue(1))
++    });
++    let instance = linker.instantiate(&mut store, &module).unwrap();
++    let run = instance
++        .get_typed_func::<(), Option<wasmtime::Rooted<wasmtime::ExternRef>>>(&mut store, "run")
++        .unwrap();
++    let value = run.call(&mut store, ()).unwrap().unwrap();
++    assert_eq!(*store.data(), 1);
++    assert_eq!(
++        value.data(&store).unwrap().unwrap().downcast_ref::<i32>(),
++        Some(&42)
++    );
++}
++
++#[test]
++fn polling_checks_host_exceptions_before_guest_catch() {
++    for action in 0..4 {
++        let engine = polling_engine(100_000);
++        let mut m = EncodedModule::new();
++        let mut types = TypeSection::new();
++        types.ty().function([], []);
++        types.ty().function([], [ValType::I32]);
++        types.ty().function([ValType::I32], []);
++        m.section(&types);
++        let mut imports = ImportSection::new();
++        imports.import("host", "throw", EntityType::Function(0));
++        m.section(&imports);
++        let mut functions = FunctionSection::new();
++        functions.function(1).function(0);
++        m.section(&functions);
++        let mut tags = TagSection::new();
++        tags.tag(TagType {
++            kind: TagKind::Exception,
++            func_type_idx: 2,
++        });
++        m.section(&tags);
++        let mut exports = ExportSection::new();
++        exports
++            .export("run", ExportKind::Func, 1)
++            .export("throw", ExportKind::Func, 2);
++        m.section(&exports);
++        let mut code = CodeSection::new();
++        let mut run = Function::new([]);
++        run.instruction(&I::Block(BlockType::Result(ValType::I32)))
++            .instruction(&I::TryTable(
++                BlockType::Empty,
++                Cow::Borrowed(&[Catch::One { tag: 0, label: 0 }]),
++            ))
++            .instruction(&I::Call(0))
++            .instruction(&I::Unreachable)
++            .instruction(&I::End)
++            .instruction(&I::Unreachable)
++            .instruction(&I::End)
++            .instruction(&I::End);
++        code.function(&run);
++        let mut throw = Function::new([]);
++        throw
++            .instruction(&I::I32Const(42))
++            .instruction(&I::Throw(0))
++            .instruction(&I::End);
++        code.function(&throw);
++        m.section(&code);
++        let module = Module::new(&engine, m.finish()).unwrap();
++        let mut linker = Linker::new(&engine);
++        let tick = engine.clone();
++        linker
++            .func_wrap(
++                "host",
++                "throw",
++                move |mut caller: wasmtime::Caller<'_, u32>| -> Result<(), Error> {
++                    let throw = caller
++                        .get_export("throw")
++                        .unwrap()
++                        .into_func()
++                        .unwrap()
++                        .typed::<(), ()>(&caller)?;
++                    let error = throw.call(&mut caller, ()).unwrap_err();
++                    assert!(error.is::<wasmtime::ThrownException>());
++                    tick.increment_epoch();
++                    Err(error)
++                },
++            )
++            .unwrap();
++        let mut store = Store::new(&engine, 0_u32);
++        store.set_fuel(1_000_000).unwrap();
++        store.set_epoch_deadline(1);
++        store.epoch_deadline_callback(move |mut context| {
++            *context.data_mut() += 1;
++            context.gc(None)?;
++            match action {
++                0 => Ok(UpdateDeadline::Continue(1)),
++                1 => Ok(UpdateDeadline::Yield(1)),
++                2 => Ok(UpdateDeadline::Interrupt),
++                3 => Err(Error::msg("host-exception deadline stop")),
++                _ => unreachable!(),
++            }
++        });
++        let (instance, _) = finish(linker.instantiate_async(&mut store, &module));
++        let run = instance
++            .unwrap()
++            .get_typed_func::<(), i32>(&mut store, "run")
++            .unwrap();
++        let (result, polls) = finish(run.call_async(&mut store, ()));
++        assert_eq!(*store.data(), 1, "action={action}");
++        match action {
++            0 => assert_eq!(result.unwrap(), 42),
++            1 => {
++                assert_eq!(result.unwrap(), 42);
++                assert!(polls >= 2);
++            }
++            2 => assert_eq!(
++                result.unwrap_err().downcast_ref::<Trap>(),
++                Some(&Trap::Interrupt)
++            ),
++            3 => assert_eq!(
++                result.unwrap_err().root_cause().to_string(),
++                "host-exception deadline stop"
++            ),
++            _ => unreachable!(),
++        }
++        assert!(!store.has_pending_exception());
++    }
++}

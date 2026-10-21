@@ -1,0 +1,806 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Tue, 20 Oct 2026 18:14:52 +0800
+Subject: [PATCH 3/3] runtime: defer imported-table function reference
+ materialization
+
+Retain immutable active-segment function indices in shared module metadata
+and bounded source/range bindings on imported function tables. Preserve
+bounds checks, segment order and fuel at initialization while materializing
+VMFuncRef records through existing lazy reads. Explicit writes retain their
+initialized tags; unsupported forms and bounded-history overflow stay eager.
+
+Keep source instances alive through the Store's existing ownership,
+including failed initialization. Resolve overlapping copies before writing
+and discard binding history when pooled tables are recycled. Internal
+segment initialization must not introduce embedder call-hook transitions.
+
+Advance mandatory native metadata versions so prior Module layouts and
+builtin contracts are rejected even without optional version-string checks.
+Portable Core WebAssembly and its imports remain unchanged.
+
+Validation: source ownership/aliasing review, eager/lazy table semantics,
+overlap and explicit null writes, failed and repeated initialization,
+serialized reload, call-hook behavior, mandatory old-artifact rejection,
+and sustained application replay with matching outputs.
+---
+ crates/cranelift/src/func_environ.rs         | 42 +++++++++--
+ crates/environ/src/builtin.rs                |  4 ++
+ crates/environ/src/compile/module_environ.rs | 17 +++++
+ crates/environ/src/module.rs                 | 24 ++++---
+ crates/wasmtime/src/engine/serialization.rs  | 13 ++--
+ crates/wasmtime/src/runtime/vm/instance.rs   | 73 +++++++++++++++----
+ crates/wasmtime/src/runtime/vm/libcalls.rs   | 20 ++++++
+ crates/wasmtime/src/runtime/vm/table.rs      | 76 +++++++++++++++++++-
+ docs/contributing-architecture.md            | 46 +++++++-----
+ docs/contributing-release-process.md         |  8 ++-
+ docs/examples-serialize.md                   |  7 ++
+ tests/all/call_hook.rs                       | 20 ++++++
+ tests/all/memory_write_limits.rs             | 48 +++++++++----
+ tests/all/metering_polling.rs                | 18 ++++-
+ 14 files changed, 348 insertions(+), 68 deletions(-)
+
+diff --git a/crates/cranelift/src/func_environ.rs b/crates/cranelift/src/func_environ.rs
+index de6ba9693f02075753d1b400b9200bf8ec700329..9b434d2e17dce3cb33df48e50481d5ab55c9ce04 100644
+--- a/crates/cranelift/src/func_environ.rs
++++ b/crates/cranelift/src/func_environ.rs
+@@ -1004,7 +1004,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+         self.module.tables[index]
+     }
+ 
+-    /// Cast the value to I64 and sign extend if necessary.
++    /// Cast the value to I64 and zero extend if necessary.
+     ///
+     /// Returns the value casted to I64.
+     fn cast_index_to_i64(
+@@ -6086,8 +6086,14 @@ impl FuncEnvironment<'_> {
+                 }
+             }
+         }
+-        for segment in self.translation.table_initialization.segments.iter() {
+-            self.module_initialize_table_with_segment(builder, segment)?;
++        for (segment_index, segment) in self
++            .translation
++            .table_initialization
++            .segments
++            .iter()
++            .enumerate()
++        {
++            self.module_initialize_table_with_segment(builder, segment, segment_index)?;
+         }
+         match &self.translation.memory_init {
+             MemoryInit::Unprocessed(_) => unreachable!(),
+@@ -6223,12 +6229,13 @@ impl FuncEnvironment<'_> {
+     ///
+     /// Note that this isn't done for "precomputed" tables which won't have
+     /// initializers present. Additionally note that this doesn't use
+-    /// `table.init` because the element segment won't actually be present
+-    /// anywhere at runtime.
++    /// `table.init` because active segments are unavailable to that instruction.
++    /// Eligible function-index lists are retained separately for lazy reads.
+     fn module_initialize_table_with_segment(
+         &mut self,
+         builder: &mut FunctionBuilder,
+         segment: &TableSegment,
++        segment_index: usize,
+     ) -> WasmResult<()> {
+         let offset = self.translate_const_expr(builder, &segment.offset)?;
+         let segment_len = builder.ins().iconst(
+@@ -6253,6 +6260,31 @@ impl FuncEnvironment<'_> {
+             .table_init_per_element;
+         let fuel = self.pre_translate_bulk_op(builder, segment_len, cost);
+ 
++        if self.tunables.table_lazy_init
++            && self.module.is_imported_table(segment.table_index)
++            && matches!(segment.elements, TableSegmentElements::Functions(_))
++        {
++            // Preserve bounds checks and element fuel charges at the original
++            // initialization boundary; defer only construction of VMFuncRefs.
++            let vmctx = self.vmctx_val(&mut builder.cursor());
++            let table = builder
++                .ins()
++                .iconst(I32, i64::from(segment.table_index.as_u32()));
++            let segment_id = builder
++                .ins()
++                .iconst(I32, i64::from(u32::try_from(segment_index).unwrap()));
++            let offset = self.cast_index_to_i64(
++                &mut builder.cursor(),
++                offset,
++                self.module.tables[segment.table_index].idx_type,
++            );
++            let libcall = self.builtin_functions.table_init_func_segment(builder.func);
++            builder
++                .ins()
++                .call(libcall, &[vmctx, table, segment_id, offset]);
++            return self.post_translate_bulk_op(builder, fuel);
++        }
++
+         // Re-use the `table.set` translation for making this a simple function
+         // to define. That re-executes the bounds check which is a bit
+         // inefficient, but can be optimized in the future.
+diff --git a/crates/environ/src/builtin.rs b/crates/environ/src/builtin.rs
+index 27398d1af97f259aa0ccde33fc4042ce9076991e..fc911c4f63290bedab7e286f9c1c666ec7e5d8fa 100644
+--- a/crates/environ/src/builtin.rs
++++ b/crates/environ/src/builtin.rs
+@@ -187,6 +187,10 @@ macro_rules! foreach_builtin_function {
+                 contref_id: u32,
+                 result: pointer
+             ) -> bool;
++
++            // Apply an active function segment without eagerly materializing
++            // all of its function records. Bounds and ordering remain eager.
++            table_init_func_segment(vmctx: vmctx, table: u32, segment: u32, offset: u64) -> bool;
+         }
+     };
+ }
+diff --git a/crates/environ/src/compile/module_environ.rs b/crates/environ/src/compile/module_environ.rs
+index 165013a2d95de9c98e8ef2966dab5d9b106af935..eb5c76c743820cbc60a640d58b34b9f970661a2d 100644
+--- a/crates/environ/src/compile/module_environ.rs
++++ b/crates/environ/src/compile/module_environ.rs
+@@ -1505,6 +1505,23 @@ impl ModuleTranslation<'_> {
+     pub fn finalize_table_init(&mut self, tunables: &Tunables, types: &mut ModuleTypesBuilder) {
+         if tunables.table_lazy_init {
+             self.try_func_table_init();
++            // try_func_table_init removes a prefix, so capture segment positions
++            // only afterwards to match startup translation. General expressions
++            // retain their existing eager evaluation and ordering.
++            self.module.deferred_table_segments = self
++                .table_initialization
++                .segments
++                .iter()
++                .map(|segment| match &segment.elements {
++                    TableSegmentElements::Functions(indices)
++                        if self.module.is_imported_table(segment.table_index) =>
++                    {
++                        indices.iter().copied().try_collect().panic_on_oom()
++                    }
++                    _ => TryVec::new(),
++                })
++                .try_collect()
++                .panic_on_oom();
+         }
+ 
+         // If any table has a non-null initializers, or if there's any active
+diff --git a/crates/environ/src/module.rs b/crates/environ/src/module.rs
+index 9db128df5be465dcbcd7dcd8f74bb28cb9d41f7a..344347630b3e52740e6c55b7d652c3ee65d75e43 100644
+--- a/crates/environ/src/module.rs
++++ b/crates/environ/src/module.rs
+@@ -96,19 +96,18 @@ pub struct TableInitialization {
+     /// Initial values for tables defined within the module itself.
+     ///
+     /// This contains the initial values and initializers for tables defined
+-    /// within a wasm, so excluding imported tables. This initializer can
+-    /// represent null-initialized tables, element-initialized tables (e.g. with
+-    /// the function-references proposal), or precomputed images of table
+-    /// initialization. For example table initializers to a table that are all
+-    /// in-bounds will get removed from `segment` and moved into
+-    /// `initial_values` here.
++    /// within a wasm, so excluding imported tables. Initial values are null or
++    /// constant expressions (e.g. with the function-references proposal).
++    /// When an initial value is precomputed in [`Module::table_initialization`],
++    /// its entry here becomes [`TableInitialValue::Null`].
+     pub initial_values: TryPrimaryMap<DefinedTableIndex, TableInitialValue>,
+ 
+     /// Element segments present in the initial wasm module which are executed
+     /// at instantiation time.
+     ///
+-    /// These element segments are iterated over during instantiation to apply
+-    /// any segments that weren't already moved into `initial_values` above.
++    /// Finalization removes segments folded into [`Module::table_initialization`].
++    /// The remaining segments execute in order during startup; their positions
++    /// also index [`Module::deferred_table_segments`] when lazy init is enabled.
+     pub segments: TryVec<TableSegment>,
+ }
+ 
+@@ -201,6 +200,12 @@ pub struct Module {
+     /// to be infallible as part of [`ModuleTranslation::finalize_table_init`].
+     pub table_initialization: TryPrimaryMap<DefinedTableIndex, TryVec<FuncIndex>>,
+ 
++    /// Shared function indices for active imported-table segments, indexed by
++    /// their position in `TableInitialization::segments` after finalization.
++    /// Ineligible segments have empty lists. Runtime bindings identify the
++    /// contributing instance, which its Store retains even if startup traps.
++    pub deferred_table_segments: TryVec<TryVec<FuncIndex>>,
++
+     /// WebAssembly linear memory initializer.
+     ///
+     /// This will track how memory is initialized, either exclusively via
+@@ -306,6 +311,7 @@ impl Module {
+             exports: Default::default(),
+             startup: ModuleStartup::None,
+             table_initialization: Default::default(),
++            deferred_table_segments: Default::default(),
+             memory_initialization: Default::default(),
+             passive_elements: Default::default(),
+             runtime_data: Default::default(),
+@@ -651,6 +657,7 @@ impl TypeTrace for Module {
+             exports: _,
+             startup,
+             table_initialization: _,
++            deferred_table_segments: _,
+             memory_initialization: _,
+             passive_elements: _,
+             runtime_data: _,
+@@ -703,6 +710,7 @@ impl TypeTrace for Module {
+             exports: _,
+             startup,
+             table_initialization: _,
++            deferred_table_segments: _,
+             memory_initialization: _,
+             passive_elements: _,
+             runtime_data: _,
+diff --git a/crates/wasmtime/src/engine/serialization.rs b/crates/wasmtime/src/engine/serialization.rs
+index 195381e505227995a7505a7a001b183017bb7643..eef87457d2c63f55e3c5a2470e9cf30062877933 100644
+--- a/crates/wasmtime/src/engine/serialization.rs
++++ b/crates/wasmtime/src/engine/serialization.rs
+@@ -37,14 +37,15 @@ use object::{
+ use serde_derive::{Deserialize, Serialize};
+ use wasmtime_environ::{FlagValue, ObjectKind, OperatorCostStrategy, Tunables, obj};
+ 
+-// Bulk-memory libcalls now return a trapping result. Code built with the old
+-// calling convention must not ignore a denied write, nor may an older runtime
+-// supply a void-returning libcall to a new trampoline. This check is independent
+-// of the optional version string and also participates in compilation cache keys.
+-pub(crate) const ENGINE_METADATA_VERSION: u8 = 2;
++// Versions 4/5 add deferred imported-table segment metadata to Module and its
++// initialization builtin. Versions 2/3 used the previous Module layout (and
++// introduced trapping bulk-memory libcalls). Reject them before decoding Module,
++// independently of the optional version string. This version also participates
++// in compilation cache and precompile compatibility keys.
++pub(crate) const ENGINE_METADATA_VERSION: u8 = 4;
+ // Keep polling artifacts distinct: replacing their interval with zero must not
+ // admit code without internal epoch checks to an ordinary epoch engine.
+-const FUEL_EPOCH_POLLING_VERSION: u8 = 3;
++const FUEL_EPOCH_POLLING_VERSION: u8 = 5;
+ 
+ /// Verifies that the serialized engine in `mmap` is compatible with the
+ /// `engine` provided.
+diff --git a/crates/wasmtime/src/runtime/vm/instance.rs b/crates/wasmtime/src/runtime/vm/instance.rs
+index ee19bdd61edb9b6b84b79be058f9e638d9dd5049..828e3de754276d015a92526c8c8ab55a4b346c1e 100644
+--- a/crates/wasmtime/src/runtime/vm/instance.rs
++++ b/crates/wasmtime/src/runtime/vm/instance.rs
+@@ -1051,6 +1051,41 @@ impl Instance {
+         self.wasm_data(range)
+     }
+ 
++    pub(crate) fn initialize_deferred_func_segment(
++        self: Pin<&mut Self>,
++        registry: &ModuleRegistry,
++        table_index: TableIndex,
++        segment: u32,
++        start: u64,
++    ) -> Result<()> {
++        let (module, mut instance) = self.module_and_self();
++        let indices = &module.deferred_table_segments[segment as usize];
++        let source = instance.vmctx().into();
++        let deferred = {
++            let (idx, owner) = instance
++                .as_mut()
++                .defined_table_index_and_instance(table_index);
++            owner.get_defined_table(idx).defer_func_segment(
++                start,
++                indices.len() as u64,
++                source,
++                segment,
++            )?
++        };
++        if !deferred {
++            for (offset, &function) in indices.iter().enumerate() {
++                let function = instance.as_mut().get_func_ref(registry, function);
++                let (idx, owner) = instance
++                    .as_mut()
++                    .defined_table_index_and_instance(table_index);
++                owner
++                    .get_defined_table(idx)
++                    .set_func(start + offset as u64, function)?;
++            }
++        }
++        Ok(())
++    }
++
+     /// Get a table by index regardless of whether it is locally-defined
+     /// or an imported, foreign table. Ensure that the given range of
+     /// elements in the table is lazily initialized.  We define this
+@@ -1076,6 +1111,8 @@ impl Instance {
+     /// given the provided `idx`.
+     ///
+     /// The `range` specified is eagerly initialized for funcref tables.
++    /// Deferred segments can access sibling instances even though this table
++    /// is locally defined; callers must not hold independent instance borrows.
+     pub fn get_defined_table_with_lazy_init(
+         mut self: Pin<&mut Self>,
+         registry: &ModuleRegistry,
+@@ -1097,19 +1134,29 @@ impl Instance {
+                     Err(_) => break,
+                 };
+ 
+-                // The table element `i` is uninitialized and is now being
+-                // initialized. This must imply that a `precompiled` list of
+-                // function indices is available for this table. The precompiled
+-                // list is extracted and then it is consulted with `i` to
+-                // determine the function that is going to be initialized. Note
+-                // that `i` may be outside the limits of the static
+-                // initialization so it's a fallible `get` instead of an index.
+-                let module = self.env_module();
+-                let precomputed = &module.table_initialization[idx];
+-                // Panicking here helps catch bugs rather than silently truncating by accident.
+-                let func_index = precomputed.get(usize::try_from(i).unwrap()).cloned();
+-                let func_ref = func_index
+-                    .and_then(|func_index| self.as_mut().get_func_ref(registry, func_index));
++                // An imported-table segment can replace the owner's static
++                // initializer. Resolve its contributing instance first; outside
++                // those ranges, a missing static initializer means null.
++                let index = usize::try_from(i).unwrap();
++                let deferred = self.tables[idx].1.deferred_func_segment(index);
++                let func_ref = if let Some(deferred) = deferred {
++                    // SAFETY: startup runs after Store insertion, so the source
++                    // remains alive even if a later segment or start traps.
++                    // Imports are from the same Store. sibling_vmctx_mut ties
++                    // the source borrow to our exclusive instance borrow; no
++                    // table or owner access occurs until it ends.
++                    let source = unsafe {
++                        self.as_mut()
++                            .sibling_vmctx_mut(deferred.source.as_non_null())
++                    };
++                    let function = source.env_module().deferred_table_segments
++                        [deferred.segment as usize][index - deferred.start];
++                    source.get_func_ref(registry, function)
++                } else {
++                    let precomputed = &self.env_module().table_initialization[idx];
++                    let func_index = precomputed.get(index).copied();
++                    func_index.and_then(|function| self.as_mut().get_func_ref(registry, function))
++                };
+                 self.as_mut().tables_mut()[idx]
+                     .1
+                     .set_func(i, func_ref)
+diff --git a/crates/wasmtime/src/runtime/vm/libcalls.rs b/crates/wasmtime/src/runtime/vm/libcalls.rs
+index 9ed90bf8df773b742af17fb3369d0347423bd519..f18447781ef9b94995795e2717155d54edf08698 100644
+--- a/crates/wasmtime/src/runtime/vm/libcalls.rs
++++ b/crates/wasmtime/src/runtime/vm/libcalls.rs
+@@ -153,6 +153,10 @@ pub mod raw {
+         // are used. The write handler has an explicit no-reentry contract.
+         (@call_hooks memory_copy) => (false);
+         (@call_hooks memory_fill) => (false);
++        // Eager active function segments use infallible ref_func calls, which
++        // do not invoke hooks. Deferring them must not introduce embedder
++        // reentry or hook traps between segment application and its fuel charge.
++        (@call_hooks table_init_func_segment) => (false);
+         (@call_hooks $name:ident) => (true);
+ 
+         (@ty u32) => (u32);
+@@ -416,6 +420,22 @@ fn ref_func(store: &mut dyn VMStore, instance: InstanceId, func_index: u32) -> N
+         .cast()
+ }
+ 
++fn table_init_func_segment(
++    store: &mut dyn VMStore,
++    instance: InstanceId,
++    table_index: u32,
++    segment: u32,
++    offset: u64,
++) -> Result<()> {
++    let (instance, registry) = store.instance_and_module_registry_mut(instance);
++    instance.initialize_deferred_func_segment(
++        registry,
++        TableIndex::from_u32(table_index),
++        segment,
++        offset,
++    )
++}
++
+ // Returns a table entry after lazily initializing it.
+ fn table_get_lazy_init_func_ref(
+     store: &mut dyn VMStore,
+diff --git a/crates/wasmtime/src/runtime/vm/table.rs b/crates/wasmtime/src/runtime/vm/table.rs
+index fceb5fc55cecbadd23ae58c75109710146ca6903..2b5b53e13f917c9c397ab3ae010186e97fcb5b26 100644
+--- a/crates/wasmtime/src/runtime/vm/table.rs
++++ b/crates/wasmtime/src/runtime/vm/table.rs
+@@ -5,7 +5,7 @@
+ use crate::prelude::*;
+ use crate::runtime::store::StoreResourceLimiter;
+ use crate::runtime::vm::stack_switching::VMContObj;
+-use crate::runtime::vm::vmcontext::{VMFuncRef, VMTableDefinition};
++use crate::runtime::vm::vmcontext::{VMContext, VMFuncRef, VMTableDefinition};
+ use crate::runtime::vm::{GcStore, SendSyncPtr, VMGcRef, VmPtr};
+ use core::alloc::Layout;
+ use core::cmp;
+@@ -132,6 +132,16 @@ impl From<StaticContTable> for StaticTable {
+     }
+ }
+ 
++#[derive(Clone, Copy)]
++pub(super) struct DeferredFuncSegment {
++    pub start: usize,
++    pub end: usize,
++    // The Store owns this instance, including after failed startup. Dropping a
++    // table must never dereference the source; Store teardown has no such order.
++    pub source: VmPtr<VMContext>,
++    pub segment: u32,
++}
++
+ pub struct StaticFuncTable {
+     /// Where data for this table is stored. The length of this list is the
+     /// maximum size of the table.
+@@ -140,6 +150,7 @@ pub struct StaticFuncTable {
+     size: usize,
+     /// Whether elements of this table are initialized lazily.
+     lazy_init: bool,
++    deferred_segments: TryVec<DeferredFuncSegment>,
+ }
+ 
+ pub struct StaticGcRefTable {
+@@ -190,6 +201,7 @@ pub struct DynamicFuncTable {
+     maximum: Option<usize>,
+     /// Whether elements of this table are initialized lazily.
+     lazy_init: bool,
++    deferred_segments: TryVec<DeferredFuncSegment>,
+ }
+ 
+ pub struct DynamicGcRefTable {
+@@ -339,6 +351,7 @@ impl Table {
+                 elements: unsafe { alloc_dynamic_table_elements(minimum)? },
+                 maximum,
+                 lazy_init: tunables.table_lazy_init,
++                deferred_segments: TryVec::new(),
+             })),
+             TableElementType::GcRef => Ok(Self::from(DynamicGcRefTable {
+                 elements: unsafe { alloc_dynamic_table_elements(minimum)? },
+@@ -388,6 +401,7 @@ impl Table {
+                     data,
+                     size,
+                     lazy_init: tunables.table_lazy_init,
++                    deferred_segments: TryVec::new(),
+                 }))
+             }
+             TableElementType::GcRef => {
+@@ -711,6 +725,63 @@ impl Table {
+         Ok(Some(old_size))
+     }
+ 
++    /// Install a segment at its original startup boundary. The zero table
++    /// marker uses the existing lazy-read path; explicit writes produce tagged
++    /// values and therefore override this history without separate invalidation.
++    /// The source must already belong to the same Store as this table.
++    pub(super) fn defer_func_segment(
++        &mut self,
++        start: u64,
++        len: u64,
++        source: VmPtr<VMContext>,
++        segment: u32,
++    ) -> Result<bool> {
++        let Range { start, end } = self.validate_fill(start, len)?;
++        if start == end {
++            return Ok(true);
++        }
++        if !self.funcrefs().1 {
++            return Ok(false);
++        }
++        let deferred = match self {
++            Self::Dynamic(DynamicTable::Func(table)) => &mut table.deferred_segments,
++            Self::Static(StaticTable::Func(table)) => &mut table.deferred_segments,
++            _ => unreachable!(),
++        };
++        // Bound both metadata and first-access lookup. Additional segments use
++        // ordinary eager initialization, so long-lived imported tables cannot
++        // accumulate unbounded history. Nothing is changed on that path.
++        const MAX_DEFERRED_SEGMENTS: usize = 128;
++        if deferred.len() == MAX_DEFERRED_SEGMENTS {
++            return Ok(false);
++        }
++        // Allocation must succeed before mutating the table. A failed startup
++        // preserves all earlier segment effects, including deferred entries.
++        deferred.push(DeferredFuncSegment {
++            start,
++            end,
++            source,
++            segment,
++        })?;
++        self.funcrefs_mut().0[start..end].fill(MaybeTaggedFuncRef(None));
++        Ok(true)
++    }
++
++    pub(super) fn deferred_func_segment(&self, index: usize) -> Option<DeferredFuncSegment> {
++        let deferred = match self {
++            Self::Dynamic(DynamicTable::Func(table)) => &table.deferred_segments,
++            Self::Static(StaticTable::Func(table)) => &table.deferred_segments,
++            _ => unreachable!(),
++        };
++        // Active segments apply in declaration order. The most recent range
++        // wins, including partial overlaps with earlier contributing instances.
++        deferred
++            .iter()
++            .rev()
++            .find(|s| s.start <= index && index < s.end)
++            .copied()
++    }
++
+     /// Get reference to the specified element.
+     ///
+     /// Returns `Ok(None)` if the element is null or uninitialized.
+@@ -843,6 +914,7 @@ impl Table {
+                 data,
+                 size,
+                 lazy_init,
++                ..
+             })) => (
+                 unsafe { slice::from_raw_parts(data.as_ptr().cast(), *size) },
+                 *lazy_init,
+@@ -866,6 +938,7 @@ impl Table {
+                 data,
+                 size,
+                 lazy_init,
++                ..
+             })) => (
+                 unsafe { slice::from_raw_parts_mut(data.as_ptr().cast(), *size) },
+                 *lazy_init,
+@@ -973,6 +1046,7 @@ impl Default for Table {
+             data: SendSyncPtr::new(NonNull::from(&mut [])),
+             size: 0,
+             lazy_init: false,
++            deferred_segments: TryVec::new(),
+         })
+     }
+ }
+diff --git a/docs/contributing-architecture.md b/docs/contributing-architecture.md
+index 3fd7ddfcbc1b7be87c474bf4b48a60b4c69ed1ed..a89d6d40639c02928958557b5f2c8921862fc82f 100644
+--- a/docs/contributing-architecture.md
++++ b/docs/contributing-architecture.md
+@@ -441,25 +441,39 @@ debugging.
+ 
+ ## Tables and `externref`
+ 
+-WebAssembly tables contain reference types, currently either `funcref` or
+-`externref`. A `funcref` in Wasmtime is represented as `*mut
+-VMCallerCheckedFuncRef` and an `externref` is represented as `VMExternRef`
+-(which is internally `*mut VMExternData`). Tables are consequently represented
+-as vectors of pointers.  Table storage memory management by default goes through
+-Rust's `Vec` which uses `malloc` and friends for memory. With the pooling
+-allocator this uses preallocated memory for storage.
++WebAssembly tables contain references. A function reference in Wasmtime is a
++pointer to a `VMFuncRef`. Function table storage is dynamically allocated by
++default; the pooling allocator instead supplies preallocated storage.
++
++With lazy table initialization enabled, zero table entries mean uninitialized.
++Explicit writes, including null writes, set an initialized tag bit. Reads mask
++off that bit, or initialize a zero entry before returning its value. Defined
++tables can use precomputed function-index images. Active function-index segments
++targeting imported tables can instead record their source instance and range in
++a bounded history on the table. The immutable function-index lists belong to
++shared module metadata. Bounds checks, offset evaluation, segment order and fuel
++charges still occur during startup; only `VMFuncRef` materialization is deferred.
++General expressions and segments beyond the history limit use eager writes.
++
++A later deferred segment clears its range to the uninitialized marker after
++recording its binding. The most recent binding covering an uninitialized slot
++supplies the function. Explicit writes override these bindings until another
++segment replaces the slot. Once read, an entry is tagged and needs no further
++history lookup.
++Copies read and initialize each source before writing its destination, in the
++direction required for overlapping ranges.
+ 
+ As mentioned previously `Store` has no form of internal garbage
+ collection for wasm objects themselves so a `funcref` table in wasm is pretty
+-simple in that there's no lifetime management of any of the pointers stored
+-within, they're simply assumed to be valid for as long as the table is in use.
+-
+-For tables of `externref` the story is more complicated. The `VMExternRef` is a
+-version of `Arc<dyn Any>` but specialized in Wasmtime so JIT code knows where
+-the offset of the reference count field to directly manipulate it is.
+-Furthermore tables of `externref` values need to manage the reference count
+-field themselves, since the pointer stored in the table is required to have a
+-strong reference count allocated to it.
++simple in that there's no lifetime management of individual pointers stored
++within it. The Store retains source instances before startup, including when a
++later segment or start function traps. Table destruction does not dereference
++these sources. Pooling drops the table's history when returning its storage and
++constructs an empty history on reuse.
++
++Tables of GC references, including `externref`, store `VMGcRef` values and use
++the configured collector's read and write barriers. They do not use the function
++table tags or deferred function segments.
+ 
+ ## GC and `externref`
+ 
+diff --git a/docs/contributing-release-process.md b/docs/contributing-release-process.md
+index 0646f66d54259f60aebb7e981889f0c088a054a4..200d337ba83691298fafa858b90cd8bc2d9c5f1c 100644
+--- a/docs/contributing-release-process.md
++++ b/docs/contributing-release-process.md
+@@ -117,9 +117,11 @@ of criteria. It's done on an as-needed basis. Requirements, however, are:
+ * Wasm-level ABI-breaking changes are by default not allowed in patch releases.
+   Users are expected to, for example, be able to load `*.cwasm` artifacts from
+   before the patch release is made. If an ABI-breaking change is necessary then
+-  be sure to update `crates/wasmtime/src/engine/serialization.rs` and the
+-  `WasmtimeVersion` matching strategy to modify the string to ensure older
+-  artifacts cannot be loaded.
++  bump the mandatory engine metadata versions in
++  `crates/wasmtime/src/engine/serialization.rs` so older artifacts cannot be
++  loaded even when module-version string checking is disabled. Keep all
++  supported metadata variants distinct, and ensure compilation cache and
++  precompile compatibility keys include the changed version.
+ 
+ Making a patch release is somewhat more manual than a major version, but like
+ before there's automation to help guide the process as well and take care of
+diff --git a/docs/examples-serialize.md b/docs/examples-serialize.md
+index 30e9aea3e96c1e8e15cc6cfb7ba908db89e12b63..3e5ad37500e1d9f3d025d10d2db73d4a3b595eb1 100644
+--- a/docs/examples-serialize.md
++++ b/docs/examples-serialize.md
+@@ -9,6 +9,13 @@ repository to run the example locally:
+ 
+ This example shows how to compile a module once and serialize its compiled representation to disk and later deserialize it to skip compilation on the critical path. See also the [pre-compilation example](examples-pre-compiling-wasm.md) for ahead-of-time compilation.
+ 
++Serialized modules are native artifacts tied to compatible engine versions,
++targets and settings. Changes to native module metadata or builtin calling
++conventions require regenerating artifacts with a compatible producer. The
++mandatory engine metadata version is checked even when optional module-version
++string checking is disabled. Portable Core WebAssembly remains reusable and can
++be compiled by runtimes that do not implement the same optimizations.
++
+ ## Host Source
+ 
+ <!-- langtabs-start -->
+diff --git a/tests/all/call_hook.rs b/tests/all/call_hook.rs
+index 1041952e42c01641c408b4ff07a966071cb1fea6..5904e5ee5005fa91f2a60a20ed0d9cd6faa5c461 100644
+--- a/tests/all/call_hook.rs
++++ b/tests/all/call_hook.rs
+@@ -321,6 +321,26 @@ fn instantiate() -> Result<(), Error> {
+     assert_eq!(store.data().calls_into_wasm, 1);
+     assert_eq!(store.data().calls_into_host, 0);
+ 
++    let table = Table::new(
++        &mut store,
++        TableType::new(RefType::FUNCREF, 1, None),
++        Ref::Func(None),
++    )?;
++    let m = Module::new(
++        store.engine(),
++        r#"(module
++            (import "" "" (table 1 funcref))
++            (func $f)
++            (elem (i32.const 0) func $f))"#,
++    )?;
++    // Internal segment initialization must not add a host transition, even
++    // when deferring function records requires a fallible runtime helper.
++    store.data_mut().trap_next_call_host = true;
++    Instance::new(&mut store, &m, &[table.into()])?;
++    assert!(matches!(table.get(&mut store, 0), Some(Ref::Func(Some(_)))));
++    assert_eq!(store.data().calls_into_wasm, 2);
++    assert_eq!(store.data().calls_into_host, 0);
++
+     Ok(())
+ }
+ 
+diff --git a/tests/all/memory_write_limits.rs b/tests/all/memory_write_limits.rs
+index 1392b32b80f4709e52fb92f8ee700c29a5b6ade2..26bdbd0918db6a35825bb0be46629d856b51bc6e 100644
+--- a/tests/all/memory_write_limits.rs
++++ b/tests/all/memory_write_limits.rs
+@@ -202,7 +202,10 @@ pub(crate) fn check_growth(strategy: wasmtime::Strategy) -> wasmtime::Result<()>
+     }
+     assert_eq!(allowed.grow(&mut store, 1)?, 2);
+     assert_eq!(
+-        denied.grow(&mut store, 1).unwrap_err().downcast_ref::<Trap>(),
++        denied
++            .grow(&mut store, 1)
++            .unwrap_err()
++            .downcast_ref::<Trap>(),
+         Some(&Trap::AllocationTooLarge)
+     );
+     Ok(())
+@@ -245,13 +248,13 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
+         .file_range()
+         .unwrap()
+         .0 as usize;
+-    assert_eq!(serialized[offset], 2);
+-    for old_version in [0, 1] {
++    assert_eq!(serialized[offset], 4);
++    for old_version in [0, 1, 2, 3] {
+         let mut old = serialized.clone();
+         old[offset] = old_version;
+         let error = unsafe { Module::deserialize(&engine, old) }
+             .err()
+-            .expect("old builtin ABI must be rejected");
++            .expect("old native metadata and builtin ABI must be rejected");
+         assert!(
+             error
+                 .to_string()
+@@ -285,7 +288,10 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
+                 .unwrap()
+                 .typed::<(), ()>(&caller)?;
+             let error = put.call(&mut caller, ()).unwrap_err();
+-            assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::AllocationTooLarge));
++            assert_eq!(
++                error.downcast_ref::<Trap>(),
++                Some(&Trap::AllocationTooLarge)
++            );
+             // Catching the inner trap must let the outer Wasm activation resume.
+             Ok(())
+         },
+@@ -363,7 +369,10 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
+         .get_typed_func::<(), ()>(&mut store, "fixed_store")?
+         .call(&mut store, ())
+         .unwrap_err();
+-    assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::AllocationTooLarge));
++    assert_eq!(
++        error.downcast_ref::<Trap>(),
++        Some(&Trap::AllocationTooLarge)
++    );
+     instance
+         .get_typed_func::<(), ()>(&mut store, "nested")?
+         .call(&mut store, ())?;
+@@ -374,7 +383,10 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
+         .get_typed_func::<(), ()>(&mut store, "register_then_store")?
+         .call(&mut store, ())
+         .unwrap_err();
+-    assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::AllocationTooLarge));
++    assert_eq!(
++        error.downcast_ref::<Trap>(),
++        Some(&Trap::AllocationTooLarge)
++    );
+     assert_eq!(
+         instance
+             .get_typed_func::<(), i32>(&mut store, "healthy")?
+@@ -442,14 +454,19 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
+             .unwrap_err()
+             .is_write_denied()
+     );
+-    assert!(memory.data_mut_range(&mut store, length..length)?.is_empty());
+-    assert!(!memory
+-        .data_mut_range(&mut store, 5..4)
+-        .unwrap_err()
+-        .is_write_denied());
++    assert!(
++        memory
++            .data_mut_range(&mut store, length..length)?
++            .is_empty()
++    );
++    assert!(
++        !memory
++            .data_mut_range(&mut store, 5..4)
++            .unwrap_err()
++            .is_write_denied()
++    );
+     for (name, source_end) in [("fill", 0), ("copy", length), ("init", 8)] {
+-        let operation = instance
+-            .get_typed_func::<(i32, i32, i32), ()>(&mut store, name)?;
++        let operation = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, name)?;
+         operation.call(&mut store, (length as i32, source_end as i32, 0))?;
+         let error = operation
+             .call(&mut store, (length as i32 + 1, source_end as i32, 0))
+@@ -473,7 +490,8 @@ pub(crate) fn check(strategy: wasmtime::Strategy) -> wasmtime::Result<()> {
+         .call(&mut store, (4096, 3, 4096))?;
+     assert_eq!(&memory.data(&store)[4096..8192], &[3; 4096]);
+     assert_eq!(budget.pages.load(Ordering::Relaxed).count_ones(), 2);
+-    memory.data_mut_range(&mut store, 4096..4098)?
++    memory
++        .data_mut_range(&mut store, 4096..4098)?
+         .copy_from_slice(&[6, 7]);
+     assert_eq!(&memory.data(&store)[4096..4098], &[6, 7]);
+     memory.write(&mut store, 0, &[1, 2, 3, 4, 5])?;
+diff --git a/tests/all/metering_polling.rs b/tests/all/metering_polling.rs
+index cbd8121820157d41eebe453bf4953ba5ae189fb6..671bec14afe2d167f4accce831aae3a98dc78d1f 100644
+--- a/tests/all/metering_polling.rs
++++ b/tests/all/metering_polling.rs
+@@ -610,7 +610,23 @@ fn polling_artifact_identity_and_metadata_versions() {
+         let (offset, len) = section.file_range().unwrap();
+         let offset = usize::try_from(offset).unwrap();
+         let len = usize::try_from(len).unwrap();
+-        assert_eq!(artifact[offset], if interval == 0 { 2 } else { 3 });
++        assert_eq!(artifact[offset], if interval == 0 { 4 } else { 5 });
++        let mut config = polling_config(interval);
++        config
++            .module_version(wasmtime::ModuleVersionStrategy::None)
++            .unwrap();
++        let consumer = Engine::new(&config).unwrap();
++        for old_version in [2, 3] {
++            let mut old = artifact.clone();
++            old[offset] = old_version;
++            let error = unsafe { Module::deserialize(&consumer, &old) }.unwrap_err();
++            assert!(
++                error
++                    .to_string()
++                    .contains("mismatched version in engine section"),
++                "{error:#}"
++            );
++        }
+         if interval != 0 {
+             // These intervals fit in one postcard byte. A zero extension must
+             // not turn an artifact without internal checks into a legacy one.
