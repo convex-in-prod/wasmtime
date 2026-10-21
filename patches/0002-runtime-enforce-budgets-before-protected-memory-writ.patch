@@ -27,7 +27,7 @@ x86-64, including Cranelift and Winch protected-write execution.
  crates/wasmtime/src/engine.rs                 |   2 +
  crates/wasmtime/src/engine/serialization.rs   |  16 +-
  crates/wasmtime/src/runtime/func.rs           |   2 +-
- crates/wasmtime/src/runtime/limits.rs         |  45 +-
+ crates/wasmtime/src/runtime/limits.rs         |  51 +-
  crates/wasmtime/src/runtime/memory.rs         | 116 +++-
  .../wasmtime/src/runtime/module/registry.rs   |  53 ++
  crates/wasmtime/src/runtime/store.rs          |  55 +-
@@ -51,11 +51,11 @@ x86-64, including Cranelift and Winch protected-write execution.
  tests/all/memory_write_limits.rs              | 537 ++++++++++++++++++
  tests/all/metering_polling.rs                 |   2 +-
  winch/codegen/src/codegen/mod.rs              |  12 +-
- 29 files changed, 1322 insertions(+), 145 deletions(-)
+ 29 files changed, 1323 insertions(+), 150 deletions(-)
  create mode 100644 tests/all/memory_write_limits.rs
 
 diff --git a/crates/environ/src/builtin.rs b/crates/environ/src/builtin.rs
-index fc390ef50965e08b0d718a70ec67505706fb82d0..27398d1af97f259aa0ccde33fc4042ce9076991e 100644
+index bc4e2f5554da89063b27626b884d13b9bd0765fe..368f07ef3f5fb0b8373186cb381f9158acef8d40 100644
 --- a/crates/environ/src/builtin.rs
 +++ b/crates/environ/src/builtin.rs
 @@ -6,9 +6,9 @@ macro_rules! foreach_builtin_function {
@@ -83,7 +83,7 @@ index 6915e9ff5cc704eb51bda92ed2347a40c19fd49d..5b75a529420e664ebb444d04e1d598f2
          if let Some(compiler) = self.0.compiler() {
              compiler.triple().hash(hasher);
 diff --git a/crates/wasmtime/src/engine.rs b/crates/wasmtime/src/engine.rs
-index 16d666a4f19222ee0f164f7f278f819ec39d12a3..60b2ec540be0e4bd35b8d62cc2a50e6c16f8f9c3 100644
+index 150ffcb0f012a57330d6bcf8d0cc08442a681d53..c92e2bf5632e43e088bf12ad56c5902c00550779 100644
 --- a/crates/wasmtime/src/engine.rs
 +++ b/crates/wasmtime/src/engine.rs
 @@ -18,6 +18,8 @@ use wasmparser::WasmFeatures;
@@ -96,7 +96,7 @@ index 16d666a4f19222ee0f164f7f278f819ec39d12a3..60b2ec540be0e4bd35b8d62cc2a50e6c
  /// An `Engine` which is a global context for compilation and management of wasm
  /// modules.
 diff --git a/crates/wasmtime/src/engine/serialization.rs b/crates/wasmtime/src/engine/serialization.rs
-index afeee8bf30ef299f04ea6b05b30d4001d96c3072..195381e505227995a7505a7a001b183017bb7643 100644
+index 7787a572ff8cc85219807c5e0d178cf69de26a2d..81ce194dd8aa157dd39881dc7eda12846ed14585 100644
 --- a/crates/wasmtime/src/engine/serialization.rs
 +++ b/crates/wasmtime/src/engine/serialization.rs
 @@ -37,10 +37,14 @@ use object::{
@@ -137,10 +137,10 @@ index afeee8bf30ef299f04ea6b05b30d4001d96c3072..195381e505227995a7505a7a001b1830
          FUEL_EPOCH_POLLING_VERSION
      });
 diff --git a/crates/wasmtime/src/runtime/func.rs b/crates/wasmtime/src/runtime/func.rs
-index c8ab027e51d3fe26c848bf6a9b5be499ff4d6c25..61580646c183906f51fe067aee1483db08740d3d 100644
+index d7de03f1fb50519e38616364c0d623081e2231ed..81a14ffa29bacff5504c91042789ce0b2ab00dd5 100644
 --- a/crates/wasmtime/src/runtime/func.rs
 +++ b/crates/wasmtime/src/runtime/func.rs
-@@ -2417,7 +2417,7 @@ impl HostFunc {
+@@ -2439,7 +2439,7 @@ impl HostFunc {
          // SAFETY: this is an entrypoint of wasm which requires correct type
          // ascription of `T` itself, meaning that this should be safe to call
          // both `enter_host_from_wasm` as well as `unchecked_context_mut`.
@@ -150,7 +150,7 @@ index c8ab027e51d3fe26c848bf6a9b5be499ff4d6c25..61580646c183906f51fe067aee1483db
      /// Analog of [`Func::new_unchecked`]
      ///
 diff --git a/crates/wasmtime/src/runtime/limits.rs b/crates/wasmtime/src/runtime/limits.rs
-index 41a40b6529c87f8f18ab3b302b2c1acafc51a4fb..c4e66cbdc4f53351e87e1677ad122a61237ec2fc 100644
+index 177634d9e75bb0581dc41613d99c0c379eec11e7..91a003d1673ab2ce2a76702de48bdf16f2bf2ffd 100644
 --- a/crates/wasmtime/src/runtime/limits.rs
 +++ b/crates/wasmtime/src/runtime/limits.rs
 @@ -39,8 +39,10 @@ pub trait ResourceLimiter: Send {
@@ -166,12 +166,18 @@ index 41a40b6529c87f8f18ab3b302b2c1acafc51a4fb..c4e66cbdc4f53351e87e1677ad122a61
      ///
      /// This function is not invoked when the requested size doesn't fit in
      /// `usize`. Additionally this function is not invoked for shared memories
-@@ -73,10 +75,32 @@ pub trait ResourceLimiter: Send {
+@@ -73,16 +75,32 @@ pub trait ResourceLimiter: Send {
          maximum: Option<usize>,
      ) -> Result<bool>;
  
--    /// Notifies the resource limiter that growing a linear memory, permitted by
--    /// the `memory_growing` method, has failed.
+-    /// Notifies the resource limiter that growing a linear memory has failed.
+-    ///
+-    /// This is typically called after `memory_growing` has permitted a growth
+-    /// which then failed. It may also be called without a preceding call to
+-    /// `memory_growing` when the requested size is invalid for the linear
+-    /// memory, for example when it cannot be represented by the memory's type
+-    /// (such as a 32-bit memory with a page size of 1 byte growing to 4GiB or
+-    /// beyond).
 +    /// Notifies the limiter that Wasmtime's internal GC heap is being allocated
 +    /// or grown. This is distinct from a WebAssembly linear memory, including
 +    /// a language runtime's GC heap implemented inside that linear memory.
@@ -199,10 +205,10 @@ index 41a40b6529c87f8f18ab3b302b2c1acafc51a4fb..c4e66cbdc4f53351e87e1677ad122a61
      ///
 -    /// Note that this method is not called if `memory_growing` returns an
 +    /// Note that this method is not called if either growth callback returns an
-     /// error.
+     /// error, nor if it returns `Ok(false)`.
      ///
-     /// Reasons for failure include: the growth exceeds the `maximum` passed to
-@@ -179,6 +203,17 @@ pub trait ResourceLimiterAsync: Send {
+     /// Reasons for failure include: the requested size is not valid for the
+@@ -192,6 +210,17 @@ pub trait ResourceLimiterAsync: Send {
          maximum: Option<usize>,
      ) -> Result<bool>;
  
@@ -221,7 +227,7 @@ index 41a40b6529c87f8f18ab3b302b2c1acafc51a4fb..c4e66cbdc4f53351e87e1677ad122a61
      fn memory_grow_failed(&mut self, error: crate::Error) -> Result<()> {
          log::debug!("ignoring memory growth failure error: {error:?}");
 diff --git a/crates/wasmtime/src/runtime/memory.rs b/crates/wasmtime/src/runtime/memory.rs
-index ab418253d4ea72f95d6b2c8a572dffd053e181da..f8e3a1ae16c02d7d78d205de08a3e66b2a93961b 100644
+index 1eac1e3503842bbbafb7ac417d18345c9034ca3b..c025f647406c09570f6458401fdbe3bd1c938578 100644
 --- a/crates/wasmtime/src/runtime/memory.rs
 +++ b/crates/wasmtime/src/runtime/memory.rs
 @@ -14,22 +14,33 @@ use wasmtime_environ::DefinedMemoryIndex;
@@ -439,7 +445,7 @@ index ab418253d4ea72f95d6b2c8a572dffd053e181da..f8e3a1ae16c02d7d78d205de08a3e66b
          match result {
              Some(size) => {
 diff --git a/crates/wasmtime/src/runtime/module/registry.rs b/crates/wasmtime/src/runtime/module/registry.rs
-index f056a8d1de163a11d85437f2d216fb915e509f7e..ae938cff9f3e767909c74159e7540ffdf4f83d1f 100644
+index 79f565b030b488852d6fad2b1f62e6ba06e48314..0286b8fe98e5843d639d3477702dc46535033420 100644
 --- a/crates/wasmtime/src/runtime/module/registry.rs
 +++ b/crates/wasmtime/src/runtime/module/registry.rs
 @@ -3,6 +3,8 @@
@@ -449,9 +455,9 @@ index f056a8d1de163a11d85437f2d216fb915e509f7e..ae938cff9f3e767909c74159e7540ffd
 +#[cfg(all(feature = "std", has_native_signals, unix))]
 +use crate::runtime::vm::StoreBox;
  use crate::runtime::vm::VMWasmCallFunction;
- use crate::sync::{OnceLock, RwLock};
  use crate::vm::CompiledModuleId;
-@@ -12,6 +14,8 @@ use alloc::sync::Arc;
+ use crate::{Engine, FrameInfo, Module, prelude::*};
+@@ -11,6 +13,8 @@ use alloc::sync::Arc;
  use core::marker::PhantomData;
  use core::ops::Range;
  use core::ptr::NonNull;
@@ -460,7 +466,7 @@ index f056a8d1de163a11d85437f2d216fb915e509f7e..ae938cff9f3e767909c74159e7540ffd
  use wasmtime_environ::{
      CompiledFunctionsTable, FuncKey, StaticModuleIndex, VMSharedTypeIndex,
      collections::btree_map::Entry,
-@@ -76,8 +80,17 @@ pub struct ModuleRegistry {
+@@ -75,8 +79,17 @@ pub struct ModuleRegistry {
      /// Every module is placed in this map, but not every module will
      /// be in a LoadedCode entry, because the module may have no text.
      modules: TryBTreeMap<RegisteredModuleId, Module>,
@@ -478,7 +484,7 @@ index f056a8d1de163a11d85437f2d216fb915e509f7e..ae938cff9f3e767909c74159e7540ffd
  struct LoadedCode {
      /// The StoreCode in this range.
      code: StoreCode,
-@@ -150,6 +163,35 @@ impl<'a> ModuleOrComponent<'a> {
+@@ -149,6 +162,35 @@ impl<'a> ModuleOrComponent<'a> {
  }
  
  impl ModuleRegistry {
@@ -514,7 +520,7 @@ index f056a8d1de163a11d85437f2d216fb915e509f7e..ae938cff9f3e767909c74159e7540ffd
      /// Get a previously-registered module by id.
      pub fn module_by_id(&self, id: RegisteredModuleId) -> Option<&Module> {
          self.modules.get(id)
-@@ -332,6 +374,17 @@ impl ModuleRegistry {
+@@ -331,6 +373,17 @@ impl ModuleRegistry {
              breakpoint_state.update(&mut loaded_code.code, module)?;
          }
  
@@ -533,7 +539,7 @@ index f056a8d1de163a11d85437f2d216fb915e509f7e..ae938cff9f3e767909c74159e7540ffd
      }
  
 diff --git a/crates/wasmtime/src/runtime/store.rs b/crates/wasmtime/src/runtime/store.rs
-index 8784dbe0c5db801049dfb8ddbb381247e135b5fe..bcef99715ef90f418e2657606f62c650ffe679a7 100644
+index 61085c6dae3313b16011d539dc042e55e7705a81..d2fdbfcc4461c9be137962dceaac8fc992a8d350 100644
 --- a/crates/wasmtime/src/runtime/store.rs
 +++ b/crates/wasmtime/src/runtime/store.rs
 @@ -329,11 +329,22 @@ impl StoreResourceLimiter<'_> {
@@ -589,7 +595,7 @@ index 8784dbe0c5db801049dfb8ddbb381247e135b5fe..bcef99715ef90f418e2657606f62c650
              gc_store: None,
              #[cfg(feature = "gc")]
              gc_data: Default::default(),
-@@ -1780,6 +1797,38 @@ impl StoreOpaque {
+@@ -1802,6 +1819,38 @@ impl StoreOpaque {
          self.signal_handler = handler;
      }
  
@@ -629,7 +635,7 @@ index 8784dbe0c5db801049dfb8ddbb381247e135b5fe..bcef99715ef90f418e2657606f62c650
      pub fn vm_store_context(&self) -> &VMStoreContext {
          &self.vm_store_context
 diff --git a/crates/wasmtime/src/runtime/store/gc.rs b/crates/wasmtime/src/runtime/store/gc.rs
-index 09a63ba2cf01d1221b09cc9833dfe0f61cbdcdc7..1cca02e8def181bdb43788f00aed6a0199762494 100644
+index ce98743ab7ce01f7962279f3b4702199c54a0a41..c59716b8578f0d00cbbe244f1f7457fc5d0d4ba5 100644
 --- a/crates/wasmtime/src/runtime/store/gc.rs
 +++ b/crates/wasmtime/src/runtime/store/gc.rs
 @@ -383,7 +383,7 @@ impl StoreOpaque {
@@ -828,15 +834,15 @@ index bb2c0ca64c71be332c1419b5e4ac7e6b77bf3cb3..d52fba57190267fa4703a409f8cafb1d
      }
  }
 diff --git a/crates/wasmtime/src/runtime/vm/component.rs b/crates/wasmtime/src/runtime/vm/component.rs
-index e1599ae34f7221f98f95afec07cb003fea28499b..76079e5e6d67975dd2d6120bd9a24ec6a22ebe79 100644
+index 17ea90f0ce558639f57764f5f8be004c2f0e611a..afdf9b2353a3cf4dc295602b8673bcd23971fd4c 100644
 --- a/crates/wasmtime/src/runtime/vm/component.rs
 +++ b/crates/wasmtime/src/runtime/vm/component.rs
-@@ -267,7 +267,7 @@ impl ComponentInstance {
+@@ -269,7 +269,7 @@ impl ComponentInstance {
          let store = unsafe { &mut *reference.store.0.as_ptr() };
  
          let instance = Instance::from_wasmtime(store, reference.id);
--        catch_unwind_and_record_trap(store, |store| f(store, instance))
-+        catch_unwind_and_record_trap(store, true, |store| f(store, instance))
+-        catch_unwind_and_record_trap(store, UncaughtException::Trap, |store| f(store, instance))
++        catch_unwind_and_record_trap(store, UncaughtException::Trap, true, |store| f(store, instance))
      }
  
      /// Returns the `InstanceId` associated with the `vmctx` provided.
@@ -854,7 +860,7 @@ index 0d18ff4fb737a54b0358c410a1ff042af85a10f1..52315927d542510926049da8e50aac8a
              assert!(
                  VMCTX_AND_MEMORY.1 < handle.env_module().memories.len(),
 diff --git a/crates/wasmtime/src/runtime/vm/instance.rs b/crates/wasmtime/src/runtime/vm/instance.rs
-index 5be8d457ec7409646901d18ed948eafeaa9b1e82..ee19bdd61edb9b6b84b79be058f9e638d9dd5049 100644
+index 7ecfa1eaf09f7522a3c80ca5712af04f67524c44..be4fcae0e7f01187ab216409906529b96fb62b76 100644
 --- a/crates/wasmtime/src/runtime/vm/instance.rs
 +++ b/crates/wasmtime/src/runtime/vm/instance.rs
 @@ -319,6 +319,7 @@ impl Instance {
@@ -869,12 +875,12 @@ index 5be8d457ec7409646901d18ed948eafeaa9b1e82..ee19bdd61edb9b6b84b79be058f9e638
  
          // Thread the `store` and `instance` through panic/trap infrastructure
          // back into `f`.
--        catch_unwind_and_record_trap(store, |store| f(store, instance))
-+        catch_unwind_and_record_trap(store, call_hooks, |store| f(store, instance))
+-        catch_unwind_and_record_trap(store, UncaughtException::Propagate, |store| {
++        catch_unwind_and_record_trap(store, UncaughtException::Propagate, call_hooks, |store| {
+             f(store, instance)
+         })
      }
- 
-     /// Converts the provided `*mut VMContext` to an `Instance` pointer and
-@@ -776,13 +777,14 @@ impl Instance {
+@@ -778,13 +779,14 @@ impl Instance {
          limiter: Option<&mut StoreResourceLimiter<'_>>,
          idx: DefinedMemoryIndex,
          delta: u64,
@@ -891,10 +897,10 @@ index 5be8d457ec7409646901d18ed948eafeaa9b1e82..ee19bdd61edb9b6b84b79be058f9e638
          // Update the state used by a non-shared Wasm memory in case the base
          // pointer and/or the length changed.
 diff --git a/crates/wasmtime/src/runtime/vm/instance/allocator/pooling.rs b/crates/wasmtime/src/runtime/vm/instance/allocator/pooling.rs
-index 74ca072056df3040affe7ca1f6346628a203f909..42c6150adbf44eda720290f899af0d6f7f153a8b 100644
+index 42d4c498be24d85585ad64668c2133529bd44918..8481f2f8e2376855c9e96e16fc1565fad74c7836 100644
 --- a/crates/wasmtime/src/runtime/vm/instance/allocator/pooling.rs
 +++ b/crates/wasmtime/src/runtime/vm/instance/allocator/pooling.rs
-@@ -629,7 +629,7 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
+@@ -633,7 +633,7 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
          request: &'a mut InstanceAllocationRequest<'b, 'c>,
          ty: &'a wasmtime_environ::Memory,
          memory_index: Option<DefinedMemoryIndex>,
@@ -903,7 +909,7 @@ index 74ca072056df3040affe7ca1f6346628a203f909..42c6150adbf44eda720290f899af0d6f
      ) -> Pin<Box<dyn Future<Output = Result<(MemoryAllocationIndex, Memory)>> + Send + 'a>> {
          crate::runtime::box_future(async move {
              async {
-@@ -637,7 +637,11 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
+@@ -641,7 +641,11 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
                  // `with_flush_and_retry` but adapted for async closures instead of only
                  // sync closures. Right now that won't compile though so this is the
                  // manually expanded version of the method.
@@ -916,7 +922,7 @@ index 74ca072056df3040affe7ca1f6346628a203f909..42c6150adbf44eda720290f899af0d6f
                      Ok(result) => return Ok(result),
                      Err(e) => e,
                  };
-@@ -648,7 +652,11 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
+@@ -652,7 +656,11 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
                      }
                      let queue = self.decommit_queue(shard).lock().unwrap();
                      if self.flush_decommit_queue(queue) {
@@ -930,10 +936,10 @@ index 74ca072056df3040affe7ca1f6346628a203f909..42c6150adbf44eda720290f899af0d6f
                              Err(err) => e = err,
                          }
 diff --git a/crates/wasmtime/src/runtime/vm/instance/allocator/pooling/memory_pool.rs b/crates/wasmtime/src/runtime/vm/instance/allocator/pooling/memory_pool.rs
-index 5a554d72cd7a5cb0daae145d0c03419a5d0f1717..737d0b5b451d407d943cc9f2a3553a91417a8bcb 100644
+index ca1425c63d24094576cb49c147ebc2e160491f01..4b2a9cfb399817750e99e60f32cdc78d82340b83 100644
 --- a/crates/wasmtime/src/runtime/vm/instance/allocator/pooling/memory_pool.rs
 +++ b/crates/wasmtime/src/runtime/vm/instance/allocator/pooling/memory_pool.rs
-@@ -356,8 +356,12 @@ impl MemoryPool {
+@@ -357,8 +357,12 @@ impl MemoryPool {
          request: &mut InstanceAllocationRequest<'_, '_>,
          ty: &wasmtime_environ::Memory,
          memory_index: Option<DefinedMemoryIndex>,
@@ -946,7 +952,7 @@ index 5a554d72cd7a5cb0daae145d0c03419a5d0f1717..737d0b5b451d407d943cc9f2a3553a91
          let memory_tunables = MemoryTunables::new(tunables, MemoryKind::LinearMemory);
          let stripe_index = if let Some(pkey) = request.store.get_pkey() {
              pkey.as_stripe()
-@@ -435,6 +439,7 @@ impl MemoryPool {
+@@ -436,6 +440,7 @@ impl MemoryPool {
              base_capacity.byte_count(),
              slot,
              request.limiter.as_deref_mut(),
@@ -955,20 +961,20 @@ index 5a554d72cd7a5cb0daae145d0c03419a5d0f1717..737d0b5b451d407d943cc9f2a3553a91
          .await?;
          guard.active = false;
 diff --git a/crates/wasmtime/src/runtime/vm/interpreter.rs b/crates/wasmtime/src/runtime/vm/interpreter.rs
-index a32c26bb1c4d04430dab533fac00e5daff29065a..b8ddf780fcd7597b847bf60ed5540a52e656ddba 100644
+index 39045ffb7666ad2c22c9b3caf2b5b2a74404f38a..5a42c552edddc180c531f0dad670c3ceb6602a14 100644
 --- a/crates/wasmtime/src/runtime/vm/interpreter.rs
 +++ b/crates/wasmtime/src/runtime/vm/interpreter.rs
-@@ -475,7 +475,7 @@ impl InterpreterRef<'_> {
-                     s.entry_trap_handler()
-                 }
-                 None => {
--                    match s.test_if_trap(regs, None, |_| false) {
-+                    match s.test_if_trap(regs, None, |_| Ok(false)) {
-                         // This shouldn't be possible, so this is a fatal error
-                         // if it happens.
-                         TrapTest::NotWasm => {
+@@ -530,7 +530,7 @@ impl InterpreterRef<'_> {
+                 // SAFETY: `caller` is valid and its store is not otherwise
+                 // borrowed, per this function's contract.
+                 unsafe {
+-                    Instance::enter_host_from_wasm(caller, |store, _instance| {
++                    Instance::enter_host_from_wasm(caller, false, |store, _instance| {
+                         trap = store
+                             .store_opaque()
+                             .modules()
 diff --git a/crates/wasmtime/src/runtime/vm/libcalls.rs b/crates/wasmtime/src/runtime/vm/libcalls.rs
-index cc234ec1a499cd32547a6792ac4e88bc1fc8cfea..9ed90bf8df773b742af17fb3369d0347423bd519 100644
+index 0ce14e679fecff52ca118478e2fab87a12450820..ad863617424e6a473b3dd35539126ecc3b58ce9d 100644
 --- a/crates/wasmtime/src/runtime/vm/libcalls.rs
 +++ b/crates/wasmtime/src/runtime/vm/libcalls.rs
 @@ -10,12 +10,11 @@
@@ -1308,7 +1314,7 @@ index 9f0721be11f02bb93bbfc7f2fc6ada6f6e88bd98..59da0672283d13088401e9b7bdfa2d4a
              // Store the new size to the `VMMemoryDefinition` for JIT-generated
              // code (and runtime functions) to access. No other code can be
 diff --git a/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs b/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs
-index 4f80189a915a11f73aaf73e2f4654e17c39d4cc2..441a18cdf9a93ec4dace69e18113df9895281f43 100644
+index 1631c6e21155068f50391aeb714c5bc829d3a712..60952ebde59805830f7ba06e5895ac9d059bfaea 100644
 --- a/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs
 +++ b/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs
 @@ -9,8 +9,15 @@ use std::ptr::{self, null_mut};
@@ -1330,10 +1336,10 @@ index 4f80189a915a11f73aaf73e2f4654e17c39d4cc2..441a18cdf9a93ec4dace69e18113df98
  const UNINIT_SIGACTION: libc::sigaction = unsafe { mem::zeroed() };
  static mut PREV_SIGSEGV: libc::sigaction = UNINIT_SIGACTION;
 diff --git a/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs b/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs
-index 69438ea91fae26f1c7ddcc366e50e2a093d9c421..f47f3bc6dc6c0ca9bab79f71e7bf251326ba1bff 100644
+index e2f63159825b832046e4affd1a80a5010fc0046d..b99e9844fe5c3b2a4cbf61a1ceaeeb3d99413295 100644
 --- a/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs
 +++ b/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs
-@@ -233,7 +233,7 @@ unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINT
+@@ -235,7 +235,7 @@ unsafe extern "system" fn exception_handler(exception_info: *mut EXCEPTION_POINT
          } else {
              None
          };
@@ -1343,32 +1349,33 @@ index 69438ea91fae26f1c7ddcc366e50e2a093d9c421..f47f3bc6dc6c0ca9bab79f71e7bf2513
              TrapTest::HandledByEmbedder => EXCEPTION_CONTINUE_EXECUTION,
              TrapTest::Trap(handler) => {
 diff --git a/crates/wasmtime/src/runtime/vm/traphandlers.rs b/crates/wasmtime/src/runtime/vm/traphandlers.rs
-index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9eee9c12054 100644
+index 60ee369f686aa6005c4149ffa48c7b86f06e5a1b..722e9723673624dcd43ef5f6eaadeee134f63314 100644
 --- a/crates/wasmtime/src/runtime/vm/traphandlers.rs
 +++ b/crates/wasmtime/src/runtime/vm/traphandlers.rs
-@@ -121,9 +121,11 @@ pub(super) unsafe fn raise_preexisting_trap(store: &mut dyn VMStore) {
- /// This is primarily used in conjunction with the Cranelift-and-host boundary.
- /// This function acts as a bridge between the two to appropriately handle
- /// encoding host values to Cranelift-understood ABIs via the `HostResult`
--/// trait.
-+/// trait. `call_hooks` must be false for operations carrying raw guest-memory
-+/// pointers: general call hooks can reenter the Store and invalidate them.
+@@ -139,9 +139,13 @@ pub(super) unsafe fn raise_preexisting_trap(store: &mut dyn VMStore) {
+ /// propagate the exception to their wasm caller, but component host functions
+ /// and intrinsics are a component boundary which exceptions cannot cross, so
+ /// there the exception is instead turned into a trap.
++/// `call_hooks` is false for internal bulk operations that previously ran
++/// without host transitions. Their raw guest pointers must remain valid until
++/// the operation completes.
  pub fn catch_unwind_and_record_trap<R>(
      store: &mut dyn VMStore,
+     uncaught_exception: UncaughtException,
 +    call_hooks: bool,
      f: impl FnOnce(&mut dyn VMStore) -> R,
  ) -> R::Abi
  where
-@@ -133,7 +135,7 @@ where
+@@ -151,7 +155,7 @@ where
      // return value is always provided and if unwind information is provided
      // (e.g. `ret` is a "false"-y value) then it's recorded in TLS for the
      // unwind operation that's about to happen from Cranelift-generated code.
 -    let (ret, unwind) = R::maybe_catch_unwind(store, |store| f(store));
 +    let (ret, unwind) = R::maybe_catch_unwind(store, call_hooks, |store| f(store));
-     if let Some(unwind) = unwind {
-         tls::with(|info| info.unwrap().record_unwind(unwind));
-     }
-@@ -169,6 +171,7 @@ pub trait HostResult {
+     if let Some(mut unwind) = unwind {
+         if let UnwindReason::Trap(Ok(trap)) = &mut unwind {
+             uncaught_exception.apply(&mut trap.reason);
+@@ -190,6 +194,7 @@ pub trait HostResult {
      /// and initiate an unwind (currently through `raise_preexisting_trap`).
      fn maybe_catch_unwind(
          store: &mut dyn VMStore,
@@ -1376,7 +1383,7 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
          f: impl FnOnce(&mut dyn VMStore) -> Self,
      ) -> (Self::Abi, Option<UnwindReason>);
  }
-@@ -186,6 +189,7 @@ macro_rules! host_result_no_catch {
+@@ -207,6 +212,7 @@ macro_rules! host_result_no_catch {
                  #[allow(unreachable_code, reason = "some types uninhabited on some platforms")]
                  fn maybe_catch_unwind(
                      store: &mut dyn VMStore,
@@ -1384,7 +1391,7 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
                      f: impl FnOnce(&mut dyn VMStore) -> $t,
                  ) -> ($t, Option<UnwindReason>) {
                      (f(store), None)
-@@ -213,6 +217,7 @@ impl HostResult for NonNull<u8> {
+@@ -234,6 +240,7 @@ impl HostResult for NonNull<u8> {
      type Abi = *mut u8;
      fn maybe_catch_unwind(
          store: &mut dyn VMStore,
@@ -1392,7 +1399,7 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
          f: impl FnOnce(&mut dyn VMStore) -> Self,
      ) -> (*mut u8, Option<UnwindReason>) {
          (f(store).as_ptr(), None)
-@@ -243,8 +248,12 @@ where
+@@ -264,8 +271,12 @@ where
  
      fn maybe_catch_unwind(
          store: &mut dyn VMStore,
@@ -1405,7 +1412,7 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
          // First wrap `f` in call hooks if that feature is enabled. This is used
          // as a "pretty far down in the stack" mechanism of ensuring that hooks
          // aren't forgotten.
-@@ -255,23 +264,26 @@ where
+@@ -276,23 +287,26 @@ where
          // * host functions
          // * component versions of the above
          //
@@ -1438,8 +1445,8 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
  
              res.map_err(|e| e.into())
          };
-@@ -514,6 +526,10 @@ mod call_thread_state {
-         pub(super) unwind: Cell<Option<UnwindReason>>,
+@@ -566,6 +580,10 @@ mod call_thread_state {
+         pub(super) uncaught_exception: UncaughtException,
          #[cfg(all(has_native_signals))]
          pub(super) signal_handler: Option<*const SignalHandler>,
 +        #[cfg(all(feature = "std", has_native_signals, unix))]
@@ -1449,7 +1456,7 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
          pub(super) capture_backtrace: bool,
          #[cfg(feature = "coredump")]
          pub(super) capture_coredump: bool,
-@@ -539,6 +555,8 @@ mod call_thread_state {
+@@ -591,6 +609,8 @@ mod call_thread_state {
              // Unwind information should not be present as it should have
              // already been processed.
              debug_assert!(self.unwind.replace(None).is_none());
@@ -1458,7 +1465,7 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
          }
      }
  
-@@ -553,6 +571,10 @@ mod call_thread_state {
+@@ -607,6 +627,10 @@ mod call_thread_state {
                  unwinder: store.unwinder(),
                  #[cfg(all(has_native_signals))]
                  signal_handler: store.signal_handler(),
@@ -1469,7 +1476,7 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
                  capture_backtrace: store.engine().config().wasm_backtrace_max_frames.is_some(),
                  #[cfg(feature = "coredump")]
                  capture_coredump: store.engine().config().coredump_on_trap,
-@@ -723,6 +745,18 @@ impl CallThreadState {
+@@ -777,6 +801,18 @@ impl CallThreadState {
  
      #[cold]
      fn read_unwind(&self) -> UnwindReason {
@@ -1488,7 +1495,7 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
          self.unwind.replace(None).unwrap()
      }
  
-@@ -977,34 +1011,58 @@ impl CallThreadState {
+@@ -1059,34 +1095,58 @@ impl CallThreadState {
          &self,
          regs: TrapRegisters,
          faulting_addr: Option<usize>,
@@ -1561,7 +1568,7 @@ index 7ea34b1473f19a21791962efe1840cfd4edd63fc..c26a823f2592b5fe482a169ed33ed9ee
          let entry_handler = self.entry_trap_handler();
          TrapTest::Trap(entry_handler)
 diff --git a/tests/all/limits.rs b/tests/all/limits.rs
-index 1e75a38d12576feaa9d5a950ab4516e0a35f55a7..75399dba0636a11390f0f87f2153d152f105c014 100644
+index bff7d1b748308cfe8982e7e012e0311e1a4afb6e..30b913bbdc96f4c46fa95981e2dad4d9a98bb95e 100644
 --- a/tests/all/limits.rs
 +++ b/tests/all/limits.rs
 @@ -2,6 +2,189 @@ use wasmtime::*;
@@ -1755,10 +1762,10 @@ index 1e75a38d12576feaa9d5a950ab4516e0a35f55a7..75399dba0636a11390f0f87f2153d152
  #[cfg_attr(miri, ignore)]
  fn test_limits() -> Result<()> {
 diff --git a/tests/all/main.rs b/tests/all/main.rs
-index 08b1b2a6395cb53b1b60ab9d951219d0ca693640..3ead258d068c0d70b4e9973fb6de324fe52975c7 100644
+index 70372fe4d7554abd48c8f1160c56bb911565b3e6..cc36df549b14e1c33aeaccc4438c2a027d44a2f6 100644
 --- a/tests/all/main.rs
 +++ b/tests/all/main.rs
-@@ -39,6 +39,7 @@ mod limits;
+@@ -41,6 +41,7 @@ mod limits;
  mod linker;
  mod memory;
  mod memory_creator;
@@ -1768,7 +1775,7 @@ index 08b1b2a6395cb53b1b60ab9d951219d0ca693640..3ead258d068c0d70b4e9973fb6de324f
  mod module;
 diff --git a/tests/all/memory_write_limits.rs b/tests/all/memory_write_limits.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..1392b32b80f4709e52fb92f8ee700c29a5b6ade2
+index 0000000000000000000000000000000000000000..ed651742d40a3664dfd8241008d633dbad3e421b
 --- /dev/null
 +++ b/tests/all/memory_write_limits.rs
 @@ -0,0 +1,537 @@
@@ -1942,8 +1949,8 @@ index 0000000000000000000000000000000000000000..1392b32b80f4709e52fb92f8ee700c29
 +                local.get 0 memory.grow))"#,
 +    )?;
 +    let mut store = Store::new(&engine, ());
-+    let allowed = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, Some(3)))?;
-+    let denied = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, Some(3)))?;
++    let allowed = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, Some(3))?)?;
++    let denied = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, Some(3))?)?;
 +    let allowed_base = allowed.data_ptr(&store) as usize;
 +    let denied_base = denied.data_ptr(&store) as usize;
 +    assert_ne!(allowed_base, denied_base);
@@ -2310,10 +2317,10 @@ index 0000000000000000000000000000000000000000..1392b32b80f4709e52fb92f8ee700c29
 +    Ok(())
 +}
 diff --git a/tests/all/metering_polling.rs b/tests/all/metering_polling.rs
-index ea7e0c7d2e236e87b2c25a94751ec28c9c0bf14a..cbd8121820157d41eebe453bf4953ba5ae189fb6 100644
+index 7b42ee75fb0c811534135c2ccf9e8c68e8112cf5..c13e621657fc9f17e3a8a18ee034303702d05308 100644
 --- a/tests/all/metering_polling.rs
 +++ b/tests/all/metering_polling.rs
-@@ -610,7 +610,7 @@ fn polling_artifact_identity_and_metadata_versions() {
+@@ -614,7 +614,7 @@ fn polling_artifact_identity_and_metadata_versions() {
          let (offset, len) = section.file_range().unwrap();
          let offset = usize::try_from(offset).unwrap();
          let len = usize::try_from(len).unwrap();
@@ -2323,10 +2330,10 @@ index ea7e0c7d2e236e87b2c25a94751ec28c9c0bf14a..cbd8121820157d41eebe453bf4953ba5
              // These intervals fit in one postcard byte. A zero extension must
              // not turn an artifact without internal checks into a legacy one.
 diff --git a/winch/codegen/src/codegen/mod.rs b/winch/codegen/src/codegen/mod.rs
-index 1fbd393c49ada785194578223b8bb1c4911304f2..23ed1dc77f8cfbd71a2777b18aec3840c5367a6c 100644
+index ca6eb0073038ee4b8274b920196cdf01db449f59..5316d86ad606069d376df8b536f9f2c5fa3fb30e 100644
 --- a/winch/codegen/src/codegen/mod.rs
 +++ b/winch/codegen/src/codegen/mod.rs
-@@ -1734,7 +1734,9 @@ where
+@@ -1775,7 +1775,9 @@ where
              &mut self.context,
              Callee::Builtin(builtin),
          )?;
@@ -2337,7 +2344,7 @@ index 1fbd393c49ada785194578223b8bb1c4911304f2..23ed1dc77f8cfbd71a2777b18aec3840
      }
  
      /// Emit the `memory.fill` operation.
-@@ -1779,7 +1781,9 @@ where
+@@ -1820,7 +1822,9 @@ where
              &mut self.context,
              Callee::Builtin(builtin),
          )?;
@@ -2348,7 +2355,7 @@ index 1fbd393c49ada785194578223b8bb1c4911304f2..23ed1dc77f8cfbd71a2777b18aec3840
      }
  
      /// Emit the `memory.init` operation.
-@@ -1885,7 +1889,9 @@ where
+@@ -1926,7 +1930,9 @@ where
              &mut self.context,
              Callee::Builtin(builtin),
          )?;

@@ -1,4 +1,4 @@
 # patch-file source-commit
-0001-wasmtime-schedule-epoch-polling-through-bounded-fuel.patch 2539448f49dec017d502164f46736b64c561e070
-0002-runtime-enforce-budgets-before-protected-memory-writ.patch e7f307dadc8e2a8de3b4d09837985e07382f7305
-0003-runtime-defer-imported-table-function-reference-mate.patch 3859871cecd40f551fff2f601642a6c230ccd888
+0001-wasmtime-schedule-epoch-polling-through-bounded-fuel.patch e3e9c74715da514ce140e49cd5bd2d34320cdb8c
+0002-runtime-enforce-budgets-before-protected-memory-writ.patch 6f141c3a54d3ea56820a99e25f9468fa92e7babd
+0003-runtime-defer-imported-table-function-reference-mate.patch ba13bdffaa34c4cfa6af8ceb58275e761593a885

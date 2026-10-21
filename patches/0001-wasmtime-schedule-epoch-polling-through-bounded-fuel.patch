@@ -27,31 +27,31 @@ metadata and hash inputs, and verify old-runtime rejection of polling
 artifacts even with module version-string checks disabled.
 ---
  DOWNSTREAM.md                                 |   40 +
- cranelift/frontend/src/frontend/safepoints.rs |  154 ++-
+ cranelift/frontend/src/frontend/safepoints.rs |  218 +++-
  crates/cranelift/src/compiler.rs              |   27 +-
- crates/cranelift/src/func_environ.rs          |  102 +-
- .../src/translate/code_translator.rs          |    2 +
+ crates/cranelift/src/func_environ.rs          |   94 +-
+ .../src/translate/code_translator.rs          |    1 +
  crates/environ/src/tunables.rs                |   25 +-
  crates/wasmtime/src/config.rs                 |   62 +
  crates/wasmtime/src/engine/serialization.rs   |   43 +-
  crates/wasmtime/src/runtime/store.rs          |   11 +-
  crates/wasmtime/src/runtime/vm/libcalls.rs    |   14 +-
  tests/all/main.rs                             |    1 +
- tests/all/metering_polling.rs                 | 1122 +++++++++++++++++
- 12 files changed, 1547 insertions(+), 56 deletions(-)
+ tests/all/metering_polling.rs                 | 1141 +++++++++++++++++
+ 12 files changed, 1586 insertions(+), 91 deletions(-)
  create mode 100644 DOWNSTREAM.md
  create mode 100644 tests/all/metering_polling.rs
 
 diff --git a/DOWNSTREAM.md b/DOWNSTREAM.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..8ba548c37a14c2d25dff7cbc7f2479858527bb66
+index 0000000000000000000000000000000000000000..7953c3265b593c40bbeb2b914f6fc66da72f8e06
 --- /dev/null
 +++ b/DOWNSTREAM.md
 @@ -0,0 +1,40 @@
 +# Downstream metering changes
 +
 +This source starts at upstream revision
-+`7ad2e732ab9ca8665d3cdd91f9c395315eeafc81`. It owns the shared compilation and
++`5afd63588b1f5520391c6a37fc38dfd3ccd607c2`. It owns the shared compilation and
 +runtime changes below so AOT producers and runtime consumers can pin the same
 +implementation without maintaining separate source copies.
 +
@@ -89,7 +89,7 @@ index 0000000000000000000000000000000000000000..8ba548c37a14c2d25dff7cbc7f247985
 +their engine metadata and hash inputs, and checking rejection of polling
 +artifacts by the legacy runtime.
 diff --git a/cranelift/frontend/src/frontend/safepoints.rs b/cranelift/frontend/src/frontend/safepoints.rs
-index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e7699264377a535133 100644
+index 71fbee1f86cda612432389daebaed91ce25673de..58efa001d23b910e29a0bae88d6d06bb7214e5f7 100644
 --- a/cranelift/frontend/src/frontend/safepoints.rs
 +++ b/cranelift/frontend/src/frontend/safepoints.rs
 @@ -104,6 +104,13 @@ impl<T> SlotSizeMap<T> {
@@ -173,7 +173,7 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
          log::trace!(
              "liveness:   found safepoint: {inst:?}: {}",
              func.dfg.display_inst(inst)
-@@ -404,11 +429,40 @@ impl LivenessAnalysis {
+@@ -404,11 +429,70 @@ impl LivenessAnalysis {
          }
      }
  
@@ -183,6 +183,22 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
 +            let start = self.events.len();
 +            let mut option_inst = func.layout.last_inst(block);
 +            while let Some(inst) = option_inst {
++                // Edge arguments are used after a try_call's safepoint. Record
++                // them first in this backwards walk so moving GC roots remain
++                // live across the call, just as in the uncached analysis.
++                for block_call in func.dfg.insts[inst]
++                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
++                {
++                    for val in block_call
++                        .args(&func.dfg.value_lists)
++                        .filter_map(|arg| arg.as_value())
++                    {
++                        let val = func.dfg.resolve_aliases(val);
++                        if stack_map_values.contains(val) {
++                            self.events.push(LivenessEvent::Use(inst, val));
++                        }
++                    }
++                }
 +                for &val in func.dfg.inst_results(inst) {
 +                    if stack_map_values.contains(val) {
 +                        self.events.push(LivenessEvent::Def(val));
@@ -191,10 +207,24 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
 +                if func.dfg.insts[inst].opcode().is_safepoint() {
 +                    self.events.push(LivenessEvent::Safepoint(inst));
 +                }
-+                for val in func.dfg.inst_values(inst) {
-+                    let val = func.dfg.resolve_aliases(val);
++                for val in func.dfg.inst_args(inst) {
++                    let val = func.dfg.resolve_aliases(*val);
 +                    if stack_map_values.contains(val) {
 +                        self.events.push(LivenessEvent::Use(inst, val));
++                    }
++                }
++                // Exception-context roots are unsupported, including in the
++                // cached walk; the context itself is not a normal operand.
++                if let Some(et) = func.dfg.insts[inst].exception_table() {
++                    for item in func.dfg.exception_tables[et].items() {
++                        let ir::ExceptionTableItem::Context(ctx) = item else {
++                            continue;
++                        };
++                        let ctx = func.dfg.resolve_aliases(ctx);
++                        assert!(
++                            !stack_map_values.contains(ctx),
++                            "exception-table context {ctx:?} on {inst:?} must not be a needs-stack-map value"
++                        );
 +                    }
 +                }
 +                option_inst = func.layout.prev_inst(inst);
@@ -216,7 +246,7 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
          block_index: usize,
          record_safepoints: RecordSafepoints,
      ) {
-@@ -420,37 +474,16 @@ impl LivenessAnalysis {
+@@ -420,73 +504,16 @@ impl LivenessAnalysis {
          self.currently_live
              .extend(self.live_outs[block_index].iter().copied());
  
@@ -224,23 +254,20 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
 -        // live-in set inside the currently-live set.
 -        let mut option_inst = func.layout.last_inst(block);
 -        while let Some(inst) = option_inst {
--            // Process any needs-stack-map values defined by this instruction.
--            for val in func.dfg.inst_results(inst) {
--                self.process_def(func, *val);
--            }
--
--            // If this instruction is a safepoint and we've been asked to record
--            // safepoints, then do so.
--            let opcode = func.dfg.insts[inst].opcode();
--            if record_safepoints == RecordSafepoints::Yes && opcode.is_safepoint() {
--                self.record_safepoint(func, inst);
--            }
--
--            // Process any needs-stack-map values used by this instruction.
--            for val in func.dfg.inst_values(inst) {
--                let val = func.dfg.resolve_aliases(val);
--                if stack_map_values.contains(val) {
--                    self.process_use(func, inst, val);
+-            // 1. Process needs-stack-map block-call args. These are
+-            // uses that logically happen *after* the instruction --
+-            // this matters for `try_call` in particular which is also
+-            // a callsite (safepoint).
+-            for block_call in func.dfg.insts[inst]
+-                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+-            {
+-                for val in block_call
+-                    .args(&func.dfg.value_lists)
+-                    .filter_map(|arg| arg.as_value())
+-                {
+-                    let val = func.dfg.resolve_aliases(val);
+-                    if stack_map_values.contains(val) {
+-                        self.process_use(func, inst, val);
 +        for index in self.block_events[block_index].clone() {
 +            match self.events[index] {
 +                LivenessEvent::Def(val) => self.process_def(func, val),
@@ -248,9 +275,47 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
 +                LivenessEvent::Safepoint(inst) => {
 +                    if record_safepoints == RecordSafepoints::Yes {
 +                        self.record_safepoint(func, inst);
-+                    }
+                     }
                  }
              }
+-
+-            // 2. Process needs-stack-map defs.
+-            for val in func.dfg.inst_results(inst) {
+-                self.process_def(func, *val);
+-            }
+-
+-            // 3. If this instruction is a safepoint and we've been
+-            // asked to record safepoints, then do so.
+-            let opcode = func.dfg.insts[inst].opcode();
+-            if record_safepoints == RecordSafepoints::Yes && opcode.is_safepoint() {
+-                self.record_safepoint(func, inst);
+-            }
+-
+-            // 4. Process any other needs-stack-map uses.
+-            for val in func.dfg.inst_args(inst) {
+-                let val = func.dfg.resolve_aliases(*val);
+-                if stack_map_values.contains(val) {
+-                    self.process_use(func, inst, val);
+-                }
+-            }
+-
+-            // We do not support GC refs as exception-context values
+-            // (Wasmtime uses its vmctx as the
+-            // exception-context). Reject this explicitly; this slot
+-            // is not handled by the analysis.
+-            if let Some(et) = func.dfg.insts[inst].exception_table() {
+-                for item in func.dfg.exception_tables[et].items() {
+-                    let ir::ExceptionTableItem::Context(ctx) = item else {
+-                        continue;
+-                    };
+-                    let ctx = func.dfg.resolve_aliases(ctx);
+-                    assert!(
+-                        !stack_map_values.contains(ctx),
+-                        "exception-table context {ctx:?} on {inst:?} must not be a \
+-                         needs-stack-map value"
+-                    );
+-                }
+-            }
 -
 -            option_inst = func.layout.prev_inst(inst);
 -        }
@@ -262,7 +327,7 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
          }
      }
  
-@@ -461,6 +494,7 @@ impl LivenessAnalysis {
+@@ -497,6 +524,7 @@ impl LivenessAnalysis {
          self.reserve_capacity(func);
          self.initialize_block_to_index_map();
          self.initialize_predecessors_map(func);
@@ -270,7 +335,7 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
  
          // Initially enqueue all blocks for processing. We push them in reverse
          // post-order (which yields them in post-order when popped) because if
-@@ -494,7 +528,7 @@ impl LivenessAnalysis {
+@@ -530,7 +558,7 @@ impl LivenessAnalysis {
              // Process the block to compute its live-in set, but do not record
              // safepoints yet, as we haven't yet processed loop back edges (see
              // below).
@@ -279,7 +344,7 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
  
              // The live-in set for a block is the set of values that are still
              // live after the block's instructions have been processed.
-@@ -517,7 +551,7 @@ impl LivenessAnalysis {
+@@ -553,7 +581,7 @@ impl LivenessAnalysis {
          // each safepoint instruction in each block, backwards from the block's
          // live-out set.
          for block_index in 0..self.post_order.len() {
@@ -288,7 +353,7 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
  
              debug_assert_eq!(
                  self.currently_live, self.live_ins[block_index],
-@@ -649,7 +683,9 @@ impl SafepointSpiller {
+@@ -685,7 +713,9 @@ impl SafepointSpiller {
  
          self.clear();
          self.liveness.run(func, stack_map_values);
@@ -299,7 +364,7 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
  
          log::trace!(
              "after inserting safepoint spills and reloads:\n{}",
-@@ -885,6 +921,56 @@ mod tests {
+@@ -1002,6 +1032,56 @@ mod tests {
          }
      }
  
@@ -357,7 +422,7 @@ index d0250a042e0c5e201d9e137b6221e23d0c805b5e..7a5ee8ef77bfd792c27377e769926437
      fn needs_stack_map_and_loop() {
          let mut sig = Signature::new(CallConv::SystemV);
 diff --git a/crates/cranelift/src/compiler.rs b/crates/cranelift/src/compiler.rs
-index f540f1b860f2e67b192fcf77beb09147e4246e6e..edd696b1992ab85d58559720bfc165e6e953b438 100644
+index cf1ea2b264ab9539dc82e072951ba58eee3fc85e..af088db0fe086028d24ed237764a8cdd10057016 100644
 --- a/crates/cranelift/src/compiler.rs
 +++ b/crates/cranelift/src/compiler.rs
 @@ -1,7 +1,7 @@
@@ -409,10 +474,10 @@ index f540f1b860f2e67b192fcf77beb09147e4246e6e..edd696b1992ab85d58559720bfc165e6
          builder.finalize(self.isa().frontend_config());
          crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(
 diff --git a/crates/cranelift/src/func_environ.rs b/crates/cranelift/src/func_environ.rs
-index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8ec700329 100644
+index 44d5da3bd690e3d0c451ab12cd59f1bdce9b25ca..e1b6ba541252ad2dddd807cb36166759a78a806c 100644
 --- a/crates/cranelift/src/func_environ.rs
 +++ b/crates/cranelift/src/func_environ.rs
-@@ -93,8 +93,20 @@ impl BuiltinFunctions {
+@@ -110,8 +110,20 @@ impl BuiltinFunctions {
          if let Some(f) = cache {
              return *f;
          }
@@ -435,7 +500,7 @@ index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8
          let (namespace, index) = key.into_raw_parts();
          let name = ir::ExternalName::User(
              func.declare_imported_user_function(ir::UserExternalName { namespace, index }),
-@@ -149,6 +161,46 @@ macro_rules! declare_function_signatures {
+@@ -166,6 +178,46 @@ macro_rules! declare_function_signatures {
  }
  wasmtime_environ::foreach_builtin_function!(declare_function_signatures);
  
@@ -482,7 +547,7 @@ index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8
  /// The `FuncEnvironment` implementation for use by the `ModuleEnvironment`.
  pub struct FuncEnvironment<'module_environment> {
      compiler: &'module_environment Compiler,
-@@ -194,6 +246,7 @@ pub struct FuncEnvironment<'module_environment> {
+@@ -211,6 +263,7 @@ pub struct FuncEnvironment<'module_environment> {
      pub(crate) offsets: VMOffsets<u8>,
  
      tunables: &'module_environment Tunables,
@@ -490,7 +555,7 @@ index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8
  
      /// A function-local variable which stores the cached value of the amount of
      /// fuel remaining to execute. If used this is modified frequently so it's
-@@ -303,6 +356,8 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+@@ -311,6 +364,8 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
              builtin_functions,
              offsets,
              tunables,
@@ -499,18 +564,10 @@ index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8
              fuel_var: Variable::reserved_value(),
              epoch_deadline_var: Variable::reserved_value(),
              epoch_ptr_var: Variable::reserved_value(),
-@@ -677,6 +732,30 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+@@ -740,6 +795,22 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
          }
      }
  
-+    pub(crate) fn translate_exception_entry(&mut self, builder: &mut FunctionBuilder<'_>) {
-+        if self.tunables.consume_fuel {
-+            // An exceptional return bypasses fuel_after_op. The callee may have
-+            // consumed or refilled fuel before unwinding to this handler.
-+            self.fuel_load_into_var(builder);
-+        }
-+    }
-+
 +    pub(crate) fn translate_exception_poll(&mut self, builder: &mut FunctionBuilder<'_>) {
 +        if self.tunables.fuel_epoch_poll_interval != 0 {
 +            // A host exception bypasses the successful host-return trampoline.
@@ -522,15 +579,15 @@ index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8
 +                &mut self.builtin_functions,
 +                vmctx,
 +            );
-+            // The deadline callback may reenter Wasm or change the fuel budget.
-+            self.fuel_load_into_var(builder);
++            // Catch entry already reloaded fuel. StoreHookState prevents epoch
++            // callbacks from changing that fuel or reentering the guest.
 +        }
 +    }
 +
      /// Adds `self.fuel_consumed` to the `fuel_var`, zero-ing out the amount of
      /// fuel consumed at that point.
      fn fuel_increment_var(&mut self, builder: &mut FunctionBuilder<'_>) {
-@@ -718,6 +797,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+@@ -781,6 +852,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
      fn fuel_check(&mut self, builder: &mut FunctionBuilder) {
          self.fuel_increment_var(builder);
          let out_of_gas_block = builder.create_block();
@@ -538,7 +595,7 @@ index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8
          let continuation_block = builder.create_block();
  
          // Note that our fuel is encoded as adding positive values to a
-@@ -899,10 +979,14 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+@@ -962,10 +1034,14 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
  
          let new_epoch = self.builtin_functions.new_epoch(builder.func);
          let vmctx = self.vmctx_val(&mut builder.cursor());
@@ -557,7 +614,7 @@ index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8
          builder.def_var(self.epoch_deadline_var, new_deadline);
          builder.ins().jump(continuation_block, &[]);
          builder.seal_block(continuation_block);
-@@ -5238,7 +5322,7 @@ impl FuncEnvironment<'_> {
+@@ -5316,7 +5392,7 @@ impl FuncEnvironment<'_> {
  
          // If we are performing epoch-based interruption, check to see
          // if the epoch counter has changed.
@@ -566,7 +623,7 @@ index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8
              self.epoch_check(builder);
          }
      }
-@@ -5304,7 +5388,9 @@ impl FuncEnvironment<'_> {
+@@ -5404,7 +5480,9 @@ impl FuncEnvironment<'_> {
          }
  
          // Initialize `epoch_var` with the current epoch.
@@ -578,18 +635,10 @@ index 91eb2fcadc0ab7fd21cf1a3c056f048223fad1ff..de6ba9693f02075753d1b400b9200bf8
          }
  
 diff --git a/crates/cranelift/src/translate/code_translator.rs b/crates/cranelift/src/translate/code_translator.rs
-index 4ed39e1cabbe31b06e966b9e18f670d411f8f7af..8be71cf1567b6cff7bbcb41437406ee39be583ab 100644
+index 027f0a0046358826269bda0bf1b8acd23af739b3..7115a64dee48c50d41a27a369e88cfecc4713232 100644
 --- a/crates/cranelift/src/translate/code_translator.rs
 +++ b/crates/cranelift/src/translate/code_translator.rs
-@@ -4631,6 +4631,7 @@ fn create_catch_block(
-     let block = builder.create_block();
-     let exn_ref = builder.append_block_param(block, exn_payload_ty);
-     builder.switch_to_block(block);
-+    environ.translate_exception_entry(builder);
-     debug_assert!(exn_ref_ty.bits() <= exn_payload_ty.bits());
-     let exn_ref = if exn_ref_ty.bits() < exn_payload_ty.bits() {
-         builder.ins().ireduce(exn_ref_ty, exn_ref)
-@@ -4641,6 +4642,7 @@ fn create_catch_block(
+@@ -4654,6 +4654,7 @@ fn create_catch_block(
      if needs_stack_map {
          builder.declare_value_needs_stack_map(exn_ref);
      }
@@ -598,7 +647,7 @@ index 4ed39e1cabbe31b06e966b9e18f670d411f8f7af..8be71cf1567b6cff7bbcb41437406ee3
      // We encode tag indices from the module directly as Cranelift
      // `ExceptionTag`s. We will translate those to (instance,
 diff --git a/crates/environ/src/tunables.rs b/crates/environ/src/tunables.rs
-index 8e0c6f03ab88cee04ee00a7978a04ac70f29b7c6..ab79d135dc5f601bbfe4b8ce2b345b3aa8902134 100644
+index e3bda884268b82317c121d33fadb27ea99f649c0..369efb51221af6b5abe6ef7692ff67eb8082feb0 100644
 --- a/crates/environ/src/tunables.rs
 +++ b/crates/environ/src/tunables.rs
 @@ -28,6 +28,12 @@ macro_rules! define_tunables {
@@ -650,7 +699,7 @@ index 8e0c6f03ab88cee04ee00a7978a04ac70f29b7c6..ab79d135dc5f601bbfe4b8ce2b345b3a
          /// Whether or not linear memories are allowed to be reallocated after
          /// initial allocation at runtime.
          pub memory_may_move: bool,
-@@ -262,6 +284,7 @@ impl Tunables {
+@@ -271,6 +293,7 @@ impl Tunables {
              consume_fuel: false,
              operator_cost: OperatorCostStrategy::Default,
              epoch_interruption: false,
@@ -659,7 +708,7 @@ index 8e0c6f03ab88cee04ee00a7978a04ac70f29b7c6..ab79d135dc5f601bbfe4b8ce2b345b3a
              guard_before_linear_memory: true,
              table_lazy_init: true,
 diff --git a/crates/wasmtime/src/config.rs b/crates/wasmtime/src/config.rs
-index b8635634ea217cc6d104839c723f3ecb6efc3137..4689326911807f08575210e051b945407c92c557 100644
+index c4f7bcddb7141eabb792a499822bd33fbeec1df5..92a556515a76ce83a2f56c202fc23541746fd7a1 100644
 --- a/crates/wasmtime/src/config.rs
 +++ b/crates/wasmtime/src/config.rs
 @@ -790,6 +790,33 @@ impl Config {
@@ -680,9 +729,9 @@ index b8635634ea217cc6d104839c723f3ecb6efc3137..4689326911807f08575210e051b94540
 +    /// a slice before reaching the next fuel checkpoint. Total fuel accounting
 +    /// and exhaustion behavior are unchanged.
 +    ///
-+    /// Zero (the default) retains ordinary epoch instrumentation and the legacy
-+    /// compiled-artifact format. Nonzero intervals require matching producer and
-+    /// consumer configuration; older runtimes reject these artifacts.
++    /// Zero (the default) retains ordinary epoch instrumentation. Native artifacts
++    /// still require this revision's ABI. Nonzero intervals also require matching
++    /// producer and consumer configuration; older runtimes reject these artifacts.
 +    ///
 +    /// This mode requires fuel consumption, epoch interruption, and default
 +    /// operator costs. This mode supports core modules. Components, stack
@@ -696,7 +745,7 @@ index b8635634ea217cc6d104839c723f3ecb6efc3137..4689326911807f08575210e051b94540
      /// XXX: For internal fuzzing and debugging use only!
      #[doc(hidden)]
      pub fn gc_zeal_alloc_counter(&mut self, counter: Option<NonZeroU32>) -> Result<&mut Self> {
-@@ -2726,6 +2753,41 @@ impl Config {
+@@ -2798,6 +2825,41 @@ impl Config {
          }
  
          self.tunables.configure(&mut tunables);
@@ -739,7 +788,7 @@ index b8635634ea217cc6d104839c723f3ecb6efc3137..4689326911807f08575210e051b94540
          // If no GC heap tunables are explicitly configured, copy the memory
          // tunables' configured values so that GC heaps default to the same
 diff --git a/crates/wasmtime/src/engine/serialization.rs b/crates/wasmtime/src/engine/serialization.rs
-index b335db1cca8c9000ecccd3c8e1244449be714aae..afeee8bf30ef299f04ea6b05b30d4001d96c3072 100644
+index d83c3b8496b770fe9bd932c6e5db16e1a9f20a19..7787a572ff8cc85219807c5e0d178cf69de26a2d 100644
 --- a/crates/wasmtime/src/engine/serialization.rs
 +++ b/crates/wasmtime/src/engine/serialization.rs
 @@ -12,10 +12,11 @@
@@ -831,7 +880,7 @@ index b335db1cca8c9000ecccd3c8e1244449be714aae..afeee8bf30ef299f04ea6b05b30d4001
              memory_may_move,
              guard_before_linear_memory,
              table_lazy_init,
-@@ -375,6 +401,11 @@ impl Metadata<'_> {
+@@ -376,6 +402,11 @@ impl Metadata<'_> {
          )?;
          Self::check_bool(consume_fuel, other.consume_fuel, "fuel support")?;
          Self::check_cost(consume_fuel, operator_cost, &other.operator_cost)?;
@@ -844,7 +893,7 @@ index b335db1cca8c9000ecccd3c8e1244449be714aae..afeee8bf30ef299f04ea6b05b30d4001
              epoch_interruption,
              other.epoch_interruption,
 diff --git a/crates/wasmtime/src/runtime/store.rs b/crates/wasmtime/src/runtime/store.rs
-index a0816548b8448013353d6c98eed3a6e78780a4d0..8784dbe0c5db801049dfb8ddbb381247e135b5fe 100644
+index ace96cef000572ae32f668221c07bf9d1456dcf3..61085c6dae3313b16011d539dc042e55e7705a81 100644
 --- a/crates/wasmtime/src/runtime/store.rs
 +++ b/crates/wasmtime/src/runtime/store.rs
 @@ -495,6 +495,7 @@ pub struct StoreOpaque {
@@ -863,7 +912,7 @@ index a0816548b8448013353d6c98eed3a6e78780a4d0..8784dbe0c5db801049dfb8ddbb381247
              store_data,
              traitobj: StorePtr(None),
              default_caller_vmctx: SendSyncPtr::new(NonNull::dangling()),
-@@ -1888,7 +1890,7 @@ impl StoreOpaque {
+@@ -1910,7 +1912,7 @@ impl StoreOpaque {
          refuel(
              injected_fuel,
              &mut self.fuel_reserve,
@@ -872,7 +921,7 @@ index a0816548b8448013353d6c98eed3a6e78780a4d0..8784dbe0c5db801049dfb8ddbb381247
          )
      }
  
-@@ -1901,7 +1903,7 @@ impl StoreOpaque {
+@@ -1923,7 +1925,7 @@ impl StoreOpaque {
          set_fuel(
              injected_fuel,
              &mut self.fuel_reserve,
@@ -881,7 +930,7 @@ index a0816548b8448013353d6c98eed3a6e78780a4d0..8784dbe0c5db801049dfb8ddbb381247
              fuel,
          );
          Ok(())
-@@ -1918,6 +1920,11 @@ impl StoreOpaque {
+@@ -1940,6 +1942,11 @@ impl StoreOpaque {
              "fuel_async_yield_interval must not be 0"
          );
  
@@ -894,10 +943,10 @@ index a0816548b8448013353d6c98eed3a6e78780a4d0..8784dbe0c5db801049dfb8ddbb381247
          // runs out and an async yield is needed.
          self.set_async_required(Asyncness::Yes);
 diff --git a/crates/wasmtime/src/runtime/vm/libcalls.rs b/crates/wasmtime/src/runtime/vm/libcalls.rs
-index 157cf8095b9d15d5d4ddf2521cba5d3459c6f336..cc234ec1a499cd32547a6792ac4e88bc1fc8cfea 100644
+index e8bc4529cddf1974f49a570f69264438e98515be..0ce14e679fecff52ca118478e2fab87a12450820 100644
 --- a/crates/wasmtime/src/runtime/vm/libcalls.rs
 +++ b/crates/wasmtime/src/runtime/vm/libcalls.rs
-@@ -725,17 +725,25 @@ fn memory_atomic_wait64(
+@@ -732,17 +732,25 @@ fn memory_atomic_wait64(
  }
  
  // Hook for when an instance runs out of fuel.
@@ -927,10 +976,10 @@ index 157cf8095b9d15d5d4ddf2521cba5d3459c6f336..cc234ec1a499cd32547a6792ac4e88bc
  
  // Hook for when an instance observes that the epoch has changed.
 diff --git a/tests/all/main.rs b/tests/all/main.rs
-index 33448abe9279723cd1bb538102a2581d62cc5a94..08b1b2a6395cb53b1b60ab9d951219d0ca693640 100644
+index f6716f696ea36a997599cb79b7a52bba2ad130bc..70372fe4d7554abd48c8f1160c56bb911565b3e6 100644
 --- a/tests/all/main.rs
 +++ b/tests/all/main.rs
-@@ -39,6 +39,7 @@ mod limits;
+@@ -41,6 +41,7 @@ mod limits;
  mod linker;
  mod memory;
  mod memory_creator;
@@ -940,10 +989,10 @@ index 33448abe9279723cd1bb538102a2581d62cc5a94..08b1b2a6395cb53b1b60ab9d951219d0
  mod module_serialize;
 diff --git a/tests/all/metering_polling.rs b/tests/all/metering_polling.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..ea7e0c7d2e236e87b2c25a94751ec28c9c0bf14a
+index 0000000000000000000000000000000000000000..7b42ee75fb0c811534135c2ccf9e8c68e8112cf5
 --- /dev/null
 +++ b/tests/all/metering_polling.rs
-@@ -0,0 +1,1122 @@
+@@ -0,0 +1,1141 @@
 +#![cfg(all(not(miri), feature = "cranelift", feature = "gc"))]
 +
 +use std::{
@@ -964,6 +1013,8 @@ index 0000000000000000000000000000000000000000..ea7e0c7d2e236e87b2c25a94751ec28c
 +    let mut config = Config::new();
 +    #[cfg(feature = "gc-copying")]
 +    config.collector(wasmtime::Collector::Copying);
++    #[cfg(all(feature = "gc-null", not(feature = "gc-copying")))]
++    config.collector(wasmtime::Collector::Null);
 +    config
 +        .consume_fuel(true)
 +        .epoch_interruption(true)
@@ -1418,6 +1469,8 @@ index 0000000000000000000000000000000000000000..ea7e0c7d2e236e87b2c25a94751ec28c
 +    let mut config = Config::new();
 +    #[cfg(feature = "gc-copying")]
 +    config.collector(wasmtime::Collector::Copying);
++    #[cfg(all(feature = "gc-null", not(feature = "gc-copying")))]
++    config.collector(wasmtime::Collector::Null);
 +    config
 +        .consume_fuel(true)
 +        .epoch_interruption(true)
@@ -1582,6 +1635,8 @@ index 0000000000000000000000000000000000000000..ea7e0c7d2e236e87b2c25a94751ec28c
 +    let mut config = Config::new();
 +    #[cfg(feature = "gc-copying")]
 +    config.collector(wasmtime::Collector::Copying);
++    #[cfg(all(feature = "gc-null", not(feature = "gc-copying")))]
++    config.collector(wasmtime::Collector::Null);
 +    config
 +        .consume_fuel(true)
 +        .epoch_interruption(true)
@@ -1909,24 +1964,28 @@ index 0000000000000000000000000000000000000000..ea7e0c7d2e236e87b2c25a94751ec28c
 +}
 +
 +#[test]
-+fn polling_preserves_host_reference_results_across_callback_gc() {
++fn polling_preserves_host_reference_results_across_callbacks_and_gc() {
 +    let engine = polling_engine(100_000);
 +    let mut m = EncodedModule::new();
 +    let mut types = TypeSection::new();
 +    types.ty().function([], [ValType::EXTERNREF]);
++    types.ty().function([], []);
 +    m.section(&types);
 +    let mut imports = ImportSection::new();
 +    imports.import("host", "value", EntityType::Function(0));
++    imports.import("host", "collect", EntityType::Function(1));
 +    m.section(&imports);
 +    let mut functions = FunctionSection::new();
 +    functions.function(0);
 +    m.section(&functions);
 +    let mut exports = ExportSection::new();
-+    exports.export("run", ExportKind::Func, 1);
++    exports.export("run", ExportKind::Func, 2);
 +    m.section(&exports);
 +    let mut code = CodeSection::new();
 +    let mut run = Function::new([]);
-+    run.instruction(&I::Call(0)).instruction(&I::End);
++    run.instruction(&I::Call(0))
++        .instruction(&I::Call(1))
++        .instruction(&I::End);
 +    code.function(&run);
 +    m.section(&code);
 +    let module = Module::new(&engine, m.finish()).unwrap();
@@ -1937,12 +1996,18 @@ index 0000000000000000000000000000000000000000..ea7e0c7d2e236e87b2c25a94751ec28c
 +        tick.increment_epoch();
 +        Ok(Some(value))
 +    }).unwrap();
++    // Epoch hooks only expose StoreHookState. Collect in a host call while
++    // the previous host result is live in the guest, after its deadline check.
++    linker
++        .func_wrap("host", "collect", |mut caller: wasmtime::Caller<'_, u32>| {
++            caller.gc(None)
++        })
++        .unwrap();
 +    let mut store = Store::new(&engine, 0_u32);
 +    store.set_fuel(1_000_000).unwrap();
 +    store.set_epoch_deadline(1);
 +    store.epoch_deadline_callback(|mut context| {
 +        *context.data_mut() += 1;
-+        context.gc(None)?;
 +        Ok(UpdateDeadline::Continue(1))
 +    });
 +    let instance = linker.instantiate(&mut store, &module).unwrap();
@@ -2009,20 +2074,24 @@ index 0000000000000000000000000000000000000000..ea7e0c7d2e236e87b2c25a94751ec28c
 +        let mut linker = Linker::new(&engine);
 +        let tick = engine.clone();
 +        linker
-+            .func_wrap(
++            .func_wrap_async(
 +                "host",
 +                "throw",
-+                move |mut caller: wasmtime::Caller<'_, u32>| -> Result<(), Error> {
-+                    let throw = caller
-+                        .get_export("throw")
-+                        .unwrap()
-+                        .into_func()
-+                        .unwrap()
-+                        .typed::<(), ()>(&caller)?;
-+                    let error = throw.call(&mut caller, ()).unwrap_err();
-+                    assert!(error.is::<wasmtime::ThrownException>());
-+                    tick.increment_epoch();
-+                    Err(error)
++                move |mut caller: wasmtime::Caller<'_, u32>, ()| {
++                    let tick = tick.clone();
++                    Box::new(async move {
++                        let throw = caller
++                            .get_export("throw")
++                            .unwrap()
++                            .into_func()
++                            .unwrap()
++                            .typed::<(), ()>(&caller)?;
++                        let error = throw.call_async(&mut caller, ()).await.unwrap_err();
++                        assert!(error.is::<wasmtime::ThrownException>());
++                        caller.gc_async(None).await?;
++                        tick.increment_epoch();
++                        Err::<(), Error>(error)
++                    })
 +                },
 +            )
 +            .unwrap();
@@ -2031,7 +2100,6 @@ index 0000000000000000000000000000000000000000..ea7e0c7d2e236e87b2c25a94751ec28c
 +        store.set_epoch_deadline(1);
 +        store.epoch_deadline_callback(move |mut context| {
 +            *context.data_mut() += 1;
-+            context.gc(None)?;
 +            match action {
 +                0 => Ok(UpdateDeadline::Continue(1)),
 +                1 => Ok(UpdateDeadline::Yield(1)),

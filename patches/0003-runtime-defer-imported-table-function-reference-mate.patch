@@ -24,27 +24,69 @@ overlap and explicit null writes, failed and repeated initialization,
 serialized reload, call-hook behavior, mandatory old-artifact rejection,
 and sustained application replay with matching outputs.
 ---
- crates/cranelift/src/func_environ.rs         | 42 +++++++++--
- crates/environ/src/builtin.rs                |  4 ++
- crates/environ/src/compile/module_environ.rs | 17 +++++
- crates/environ/src/module.rs                 | 24 ++++---
- crates/wasmtime/src/engine/serialization.rs  | 13 ++--
- crates/wasmtime/src/runtime/vm/instance.rs   | 73 +++++++++++++++----
- crates/wasmtime/src/runtime/vm/libcalls.rs   | 20 ++++++
- crates/wasmtime/src/runtime/vm/table.rs      | 76 +++++++++++++++++++-
- docs/contributing-architecture.md            | 46 +++++++-----
- docs/contributing-release-process.md         |  8 ++-
+ DOWNSTREAM.md                                | 25 +++---
+ crates/cranelift/src/func_environ.rs         | 42 ++++++++--
+ crates/environ/src/builtin.rs                |  3 +
+ crates/environ/src/compile/module_environ.rs | 17 ++++
+ crates/environ/src/module.rs                 | 24 ++++--
+ crates/environ/src/tunables.rs               | 22 +-----
+ crates/wasmtime/src/engine/serialization.rs  | 16 ++--
+ crates/wasmtime/src/runtime/vm/instance.rs   | 73 +++++++++++++----
+ crates/wasmtime/src/runtime/vm/libcalls.rs   | 26 ++++++-
+ crates/wasmtime/src/runtime/vm/table.rs      | 82 +++++++++++++++++++-
+ docs/contributing-architecture.md            | 46 +++++++----
+ docs/contributing-release-process.md         |  8 +-
  docs/examples-serialize.md                   |  7 ++
- tests/all/call_hook.rs                       | 20 ++++++
- tests/all/memory_write_limits.rs             | 48 +++++++++----
+ tests/all/call_hook.rs                       | 20 +++++
+ tests/all/memory_write_limits.rs             | 48 ++++++++----
  tests/all/metering_polling.rs                | 18 ++++-
- 14 files changed, 348 insertions(+), 68 deletions(-)
+ 16 files changed, 373 insertions(+), 104 deletions(-)
 
+diff --git a/DOWNSTREAM.md b/DOWNSTREAM.md
+index 7953c3265b593c40bbeb2b914f6fc66da72f8e06..122fd32e6f44680b5b0309760332c36586c5049d 100644
+--- a/DOWNSTREAM.md
++++ b/DOWNSTREAM.md
+@@ -14,13 +14,15 @@ implementation without maintaining separate source copies.
+   returns, and rooted exception continuations retain checks. Deadline callbacks,
+   asynchronous yields, interruptions, and exact fuel accounting remain active.
+ 
+-The interval is an engine setting inherited by every store. Zero preserves the
+-ordinary instrumentation, version-zero engine metadata bytes, and engine hash
+-input. Nonzero intervals use version-one metadata with an explicit interval;
+-an older runtime rejects that format even with module version-string validation
+-disabled. A consumer must use the same interval as its producer. Source-keyed
+-build caches must still invalidate changed compilation code; artifact
+-compatibility does not establish that an older artifact includes a newer fix.
++The interval is an engine setting inherited by every store. Zero preserves
++ordinary instrumentation. Native artifacts use metadata version six, or seven
++with an explicit nonzero polling interval. These versions include the upstream
++tunables and builtin layout and the downstream deferred table-initialization
++contract. Older native artifacts are rejected before module decoding even when
++module version-string validation is disabled. Producer and consumer must agree
++on the interval and native ABI; portable Wasm modules do not require a specific
++Wasmtime revision. Source-keyed build caches still invalidate changed compiler
++code even when native compatibility happens to be unchanged.
+ 
+ Polling supports core modules with default operator costs, fuel consumption, and
+ epoch interruption. Components have separate host-call trampolines and are not
+@@ -33,8 +35,7 @@ line block may overshoot the active slice before its next checkpoint.
+ `tests/all/metering_polling.rs` covers metering values and accounting, exceptions,
+ entry and continuation boundaries, interruption and yield behavior, reference
+ rooting through collection, configuration rejection, and artifact identities.
+-Run it with both null and copying collector configurations. Cross-version
+-acceptance also requires executing legacy artifacts in the new zero-interval
+-runtime, executing new zero-interval artifacts in the legacy runtime, comparing
+-their engine metadata and hash inputs, and checking rejection of polling
+-artifacts by the legacy runtime.
++Run it with both null and copying collector configurations. Native compatibility
++checks reject obsolete metadata versions, mismatched intervals, and tampered
++polling metadata before deserialization. Portable modules remain usable by other
++compatible WebAssembly runtimes without these native extensions.
 diff --git a/crates/cranelift/src/func_environ.rs b/crates/cranelift/src/func_environ.rs
-index de6ba9693f02075753d1b400b9200bf8ec700329..9b434d2e17dce3cb33df48e50481d5ab55c9ce04 100644
+index e1b6ba541252ad2dddd807cb36166759a78a806c..d25dafadb1b3ad27a7eeba99dc28a8cfec2ea1a7 100644
 --- a/crates/cranelift/src/func_environ.rs
 +++ b/crates/cranelift/src/func_environ.rs
-@@ -1004,7 +1004,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
+@@ -1059,7 +1059,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
          self.module.tables[index]
      }
  
@@ -53,7 +95,7 @@ index de6ba9693f02075753d1b400b9200bf8ec700329..9b434d2e17dce3cb33df48e50481d5ab
      ///
      /// Returns the value casted to I64.
      fn cast_index_to_i64(
-@@ -6086,8 +6086,14 @@ impl FuncEnvironment<'_> {
+@@ -6178,8 +6178,14 @@ impl FuncEnvironment<'_> {
                  }
              }
          }
@@ -70,7 +112,7 @@ index de6ba9693f02075753d1b400b9200bf8ec700329..9b434d2e17dce3cb33df48e50481d5ab
          }
          match &self.translation.memory_init {
              MemoryInit::Unprocessed(_) => unreachable!(),
-@@ -6223,12 +6229,13 @@ impl FuncEnvironment<'_> {
+@@ -6315,12 +6321,13 @@ impl FuncEnvironment<'_> {
      ///
      /// Note that this isn't done for "precomputed" tables which won't have
      /// initializers present. Additionally note that this doesn't use
@@ -86,7 +128,7 @@ index de6ba9693f02075753d1b400b9200bf8ec700329..9b434d2e17dce3cb33df48e50481d5ab
      ) -> WasmResult<()> {
          let offset = self.translate_const_expr(builder, &segment.offset)?;
          let segment_len = builder.ins().iconst(
-@@ -6253,6 +6260,31 @@ impl FuncEnvironment<'_> {
+@@ -6345,6 +6352,31 @@ impl FuncEnvironment<'_> {
              .table_init_per_element;
          let fuel = self.pre_translate_bulk_op(builder, segment_len, cost);
  
@@ -119,14 +161,13 @@ index de6ba9693f02075753d1b400b9200bf8ec700329..9b434d2e17dce3cb33df48e50481d5ab
          // to define. That re-executes the bounds check which is a bit
          // inefficient, but can be optimized in the future.
 diff --git a/crates/environ/src/builtin.rs b/crates/environ/src/builtin.rs
-index 27398d1af97f259aa0ccde33fc4042ce9076991e..fc911c4f63290bedab7e286f9c1c666ec7e5d8fa 100644
+index 368f07ef3f5fb0b8373186cb381f9158acef8d40..bc27833a284907d8e6ad3751c619a08abe4d0330 100644
 --- a/crates/environ/src/builtin.rs
 +++ b/crates/environ/src/builtin.rs
-@@ -187,6 +187,10 @@ macro_rules! foreach_builtin_function {
-                 contref_id: u32,
-                 result: pointer
-             ) -> bool;
-+
+@@ -199,6 +199,9 @@ macro_rules! foreach_builtin_function {
+             );
+             #[cfg(feature = "stack-switching")]
+             asan_finish_switch_fiber(vmctx: vmctx, fake_stack: pointer, current_csi: pointer);
 +            // Apply an active function segment without eagerly materializing
 +            // all of its function records. Bounds and ordering remain eager.
 +            table_init_func_segment(vmctx: vmctx, table: u32, segment: u32, offset: u64) -> bool;
@@ -134,10 +175,10 @@ index 27398d1af97f259aa0ccde33fc4042ce9076991e..fc911c4f63290bedab7e286f9c1c666e
      };
  }
 diff --git a/crates/environ/src/compile/module_environ.rs b/crates/environ/src/compile/module_environ.rs
-index 165013a2d95de9c98e8ef2966dab5d9b106af935..eb5c76c743820cbc60a640d58b34b9f970661a2d 100644
+index 937cf27e7b59695f1055df42cdde2659bbac291f..92595dfbd9130df5cb78d0d5da01783b7c51f940 100644
 --- a/crates/environ/src/compile/module_environ.rs
 +++ b/crates/environ/src/compile/module_environ.rs
-@@ -1505,6 +1505,23 @@ impl ModuleTranslation<'_> {
+@@ -1552,6 +1552,23 @@ impl ModuleTranslation<'_> {
      pub fn finalize_table_init(&mut self, tunables: &Tunables, types: &mut ModuleTypesBuilder) {
          if tunables.table_lazy_init {
              self.try_func_table_init();
@@ -162,7 +203,7 @@ index 165013a2d95de9c98e8ef2966dab5d9b106af935..eb5c76c743820cbc60a640d58b34b9f9
  
          // If any table has a non-null initializers, or if there's any active
 diff --git a/crates/environ/src/module.rs b/crates/environ/src/module.rs
-index 9db128df5be465dcbcd7dcd8f74bb28cb9d41f7a..344347630b3e52740e6c55b7d652c3ee65d75e43 100644
+index f15583615a07219f3b332d36cbbd82920fd2f300..f80f413e7b719e704b5de656c120a514cdc50be0 100644
 --- a/crates/environ/src/module.rs
 +++ b/crates/environ/src/module.rs
 @@ -96,19 +96,18 @@ pub struct TableInitialization {
@@ -205,7 +246,7 @@ index 9db128df5be465dcbcd7dcd8f74bb28cb9d41f7a..344347630b3e52740e6c55b7d652c3ee
      /// WebAssembly linear memory initializer.
      ///
      /// This will track how memory is initialized, either exclusively via
-@@ -306,6 +311,7 @@ impl Module {
+@@ -335,6 +340,7 @@ impl Module {
              exports: Default::default(),
              startup: ModuleStartup::None,
              table_initialization: Default::default(),
@@ -213,7 +254,7 @@ index 9db128df5be465dcbcd7dcd8f74bb28cb9d41f7a..344347630b3e52740e6c55b7d652c3ee
              memory_initialization: Default::default(),
              passive_elements: Default::default(),
              runtime_data: Default::default(),
-@@ -651,6 +657,7 @@ impl TypeTrace for Module {
+@@ -682,6 +688,7 @@ impl TypeTrace for Module {
              exports: _,
              startup,
              table_initialization: _,
@@ -221,7 +262,7 @@ index 9db128df5be465dcbcd7dcd8f74bb28cb9d41f7a..344347630b3e52740e6c55b7d652c3ee
              memory_initialization: _,
              passive_elements: _,
              runtime_data: _,
-@@ -703,6 +710,7 @@ impl TypeTrace for Module {
+@@ -734,6 +741,7 @@ impl TypeTrace for Module {
              exports: _,
              startup,
              table_initialization: _,
@@ -229,11 +270,62 @@ index 9db128df5be465dcbcd7dcd8f74bb28cb9d41f7a..344347630b3e52740e6c55b7d652c3ee
              memory_initialization: _,
              passive_elements: _,
              runtime_data: _,
+diff --git a/crates/environ/src/tunables.rs b/crates/environ/src/tunables.rs
+index 369efb51221af6b5abe6ef7692ff67eb8082feb0..2832a4d3159b7742f06ed7bb9335c4eb9ebddaab 100644
+--- a/crates/environ/src/tunables.rs
++++ b/crates/environ/src/tunables.rs
+@@ -28,12 +28,6 @@ macro_rules! define_tunables {
+             )*
+         }
+ 
+-        impl core::hash::Hash for $tunables {
+-            fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+-                $(define_tunables!(@hash $field, self.$field, state);)*
+-            }
+-        }
+-
+         /// Optional tunable configuration options used in `wasmtime::Config`
+         #[derive(Default, Clone)]
+         #[expect(missing_docs, reason = "macro-generated fields")]
+@@ -61,21 +55,11 @@ macro_rules! define_tunables {
+             }
+         }
+     };
+-    (@hash fuel_epoch_poll_interval, $value:expr, $state:ident) => {
+-        // Keep legacy engine/cache identities when this extension is disabled.
+-        if $value != 0 {
+-            core::hash::Hash::hash("fuel_epoch_poll_interval", $state);
+-            core::hash::Hash::hash(&$value, $state);
+-        }
+-    };
+-    (@hash $field:ident, $value:expr, $state:ident) => {
+-        core::hash::Hash::hash(&$value, $state);
+-    };
+ }
+ 
+ define_tunables! {
+     /// Tunable parameters for WebAssembly compilation.
+-    #[derive(Clone, Serialize, Deserialize, Debug)]
++    #[derive(Clone, Hash, Serialize, Deserialize, Debug)]
+     pub struct Tunables {
+         /// The garbage collector implementation to use, which implies the layout of
+         /// GC objects and barriers that must be emitted in Wasm code.
+@@ -116,8 +100,8 @@ define_tunables! {
+         pub epoch_interruption: bool,
+ 
+         /// Fuel-slice interval for internal epoch polling; zero keeps inline checks.
+-        /// Serialized separately in versioned engine metadata to preserve the
+-        /// legacy representation when this mode is disabled.
++        /// Serialized separately in versioned engine metadata so polling
++        /// artifacts can require an explicit nonzero interval.
+         #[serde(skip)]
+         pub fuel_epoch_poll_interval: u64,
+ 
 diff --git a/crates/wasmtime/src/engine/serialization.rs b/crates/wasmtime/src/engine/serialization.rs
-index 195381e505227995a7505a7a001b183017bb7643..eef87457d2c63f55e3c5a2470e9cf30062877933 100644
+index 81ce194dd8aa157dd39881dc7eda12846ed14585..65c40e1add50fd516fade4b411e00745c6f5ab7e 100644
 --- a/crates/wasmtime/src/engine/serialization.rs
 +++ b/crates/wasmtime/src/engine/serialization.rs
-@@ -37,14 +37,15 @@ use object::{
+@@ -37,14 +37,14 @@ use object::{
  use serde_derive::{Deserialize, Serialize};
  use wasmtime_environ::{FlagValue, ObjectKind, OperatorCostStrategy, Tunables, obj};
  
@@ -242,24 +334,25 @@ index 195381e505227995a7505a7a001b183017bb7643..eef87457d2c63f55e3c5a2470e9cf300
 -// supply a void-returning libcall to a new trampoline. This check is independent
 -// of the optional version string and also participates in compilation cache keys.
 -pub(crate) const ENGINE_METADATA_VERSION: u8 = 2;
-+// Versions 4/5 add deferred imported-table segment metadata to Module and its
-+// initialization builtin. Versions 2/3 used the previous Module layout (and
-+// introduced trapping bulk-memory libcalls). Reject them before decoding Module,
-+// independently of the optional version string. This version also participates
-+// in compilation cache and precompile compatibility keys.
-+pub(crate) const ENGINE_METADATA_VERSION: u8 = 4;
- // Keep polling artifacts distinct: replacing their interval with zero must not
- // admit code without internal epoch checks to an ordinary epoch engine.
+-// Keep polling artifacts distinct: replacing their interval with zero must not
+-// admit code without internal epoch checks to an ordinary epoch engine.
 -const FUEL_EPOCH_POLLING_VERSION: u8 = 3;
-+const FUEL_EPOCH_POLLING_VERSION: u8 = 5;
++// Versions 6/7 include the refreshed upstream tunables and builtin layout.
++// Versions 4/5 already carried deferred imported-table metadata, but are not
++// ABI-compatible with this layout. Reject them before decoding native module
++// data even when the embedder disables the optional source version string.
++pub(crate) const ENGINE_METADATA_VERSION: u8 = 6;
++// Polling artifacts remain distinct so removing an interval cannot admit code
++// without internal epoch checks to an ordinary epoch engine.
++const FUEL_EPOCH_POLLING_VERSION: u8 = 7;
  
  /// Verifies that the serialized engine in `mmap` is compatible with the
  /// `engine` provided.
 diff --git a/crates/wasmtime/src/runtime/vm/instance.rs b/crates/wasmtime/src/runtime/vm/instance.rs
-index ee19bdd61edb9b6b84b79be058f9e638d9dd5049..828e3de754276d015a92526c8c8ab55a4b346c1e 100644
+index be4fcae0e7f01187ab216409906529b96fb62b76..dffba44c8df72634f04800011b3dccf192ad6076 100644
 --- a/crates/wasmtime/src/runtime/vm/instance.rs
 +++ b/crates/wasmtime/src/runtime/vm/instance.rs
-@@ -1051,6 +1051,41 @@ impl Instance {
+@@ -1053,6 +1053,41 @@ impl Instance {
          self.wasm_data(range)
      }
  
@@ -301,7 +394,7 @@ index ee19bdd61edb9b6b84b79be058f9e638d9dd5049..828e3de754276d015a92526c8c8ab55a
      /// Get a table by index regardless of whether it is locally-defined
      /// or an imported, foreign table. Ensure that the given range of
      /// elements in the table is lazily initialized.  We define this
-@@ -1076,6 +1111,8 @@ impl Instance {
+@@ -1078,6 +1113,8 @@ impl Instance {
      /// given the provided `idx`.
      ///
      /// The `range` specified is eagerly initialized for funcref tables.
@@ -310,7 +403,7 @@ index ee19bdd61edb9b6b84b79be058f9e638d9dd5049..828e3de754276d015a92526c8c8ab55a
      pub fn get_defined_table_with_lazy_init(
          mut self: Pin<&mut Self>,
          registry: &ModuleRegistry,
-@@ -1097,19 +1134,29 @@ impl Instance {
+@@ -1099,19 +1136,29 @@ impl Instance {
                      Err(_) => break,
                  };
  
@@ -354,16 +447,24 @@ index ee19bdd61edb9b6b84b79be058f9e638d9dd5049..828e3de754276d015a92526c8c8ab55a
                      .1
                      .set_func(i, func_ref)
 diff --git a/crates/wasmtime/src/runtime/vm/libcalls.rs b/crates/wasmtime/src/runtime/vm/libcalls.rs
-index 9ed90bf8df773b742af17fb3369d0347423bd519..f18447781ef9b94995795e2717155d54edf08698 100644
+index ad863617424e6a473b3dd35539126ecc3b58ce9d..a20b54cbf8201f0a5a7bfd4792257f3bc2f3ac5a 100644
 --- a/crates/wasmtime/src/runtime/vm/libcalls.rs
 +++ b/crates/wasmtime/src/runtime/vm/libcalls.rs
-@@ -153,6 +153,10 @@ pub mod raw {
-         // are used. The write handler has an explicit no-reentry contract.
+@@ -148,11 +148,15 @@ pub mod raw {
+             )*
+         };
+ 
+-        // These operations already carry bounds-checked raw pointers. General
+-        // call hooks may grow memory or move GC objects before those pointers
+-        // are used. The write handler has an explicit no-reentry contract.
++        // These operations carry bounds-checked raw pointers and previously
++        // ran without call hooks. Keep that behavior with fallible write
++        // admission; the write handler must not reenter or relocate memory.
          (@call_hooks memory_copy) => (false);
          (@call_hooks memory_fill) => (false);
 +        // Eager active function segments use infallible ref_func calls, which
-+        // do not invoke hooks. Deferring them must not introduce embedder
-+        // reentry or hook traps between segment application and its fuel charge.
++        // do not invoke hooks. Deferring them must not introduce hook calls or
++        // traps between segment application and its fuel charge.
 +        (@call_hooks table_init_func_segment) => (false);
          (@call_hooks $name:ident) => (true);
  
@@ -392,7 +493,7 @@ index 9ed90bf8df773b742af17fb3369d0347423bd519..f18447781ef9b94995795e2717155d54
  fn table_get_lazy_init_func_ref(
      store: &mut dyn VMStore,
 diff --git a/crates/wasmtime/src/runtime/vm/table.rs b/crates/wasmtime/src/runtime/vm/table.rs
-index fceb5fc55cecbadd23ae58c75109710146ca6903..2b5b53e13f917c9c397ab3ae010186e97fcb5b26 100644
+index 4bac89bedeb5f371fc57a774dfa985cdc31c453d..68b87eef3bd28ecdd4dc9acc3c16c37ae6c928ba 100644
 --- a/crates/wasmtime/src/runtime/vm/table.rs
 +++ b/crates/wasmtime/src/runtime/vm/table.rs
 @@ -5,7 +5,7 @@
@@ -453,7 +554,7 @@ index fceb5fc55cecbadd23ae58c75109710146ca6903..2b5b53e13f917c9c397ab3ae010186e9
                  }))
              }
              TableElementType::GcRef => {
-@@ -711,6 +725,63 @@ impl Table {
+@@ -723,6 +737,69 @@ impl Table {
          Ok(Some(old_size))
      }
  
@@ -487,14 +588,20 @@ index fceb5fc55cecbadd23ae58c75109710146ca6903..2b5b53e13f917c9c397ab3ae010186e9
 +        if deferred.len() == MAX_DEFERRED_SEGMENTS {
 +            return Ok(false);
 +        }
-+        // Allocation must succeed before mutating the table. A failed startup
-+        // preserves all earlier segment effects, including deferred entries.
-+        deferred.push(DeferredFuncSegment {
-+            start,
-+            end,
-+            source,
-+            segment,
-+        })?;
++        // Metadata allocation must not introduce a new startup failure after
++        // CoW memory images have been installed. Eager VMFuncRef initialization
++        // is allocation-free, and a failed push leaves the table unchanged.
++        if deferred
++            .push(DeferredFuncSegment {
++                start,
++                end,
++                source,
++                segment,
++            })
++            .is_err()
++        {
++            return Ok(false);
++        }
 +        self.funcrefs_mut().0[start..end].fill(MaybeTaggedFuncRef(None));
 +        Ok(true)
 +    }
@@ -517,7 +624,7 @@ index fceb5fc55cecbadd23ae58c75109710146ca6903..2b5b53e13f917c9c397ab3ae010186e9
      /// Get reference to the specified element.
      ///
      /// Returns `Ok(None)` if the element is null or uninitialized.
-@@ -843,6 +914,7 @@ impl Table {
+@@ -855,6 +932,7 @@ impl Table {
                  data,
                  size,
                  lazy_init,
@@ -525,7 +632,7 @@ index fceb5fc55cecbadd23ae58c75109710146ca6903..2b5b53e13f917c9c397ab3ae010186e9
              })) => (
                  unsafe { slice::from_raw_parts(data.as_ptr().cast(), *size) },
                  *lazy_init,
-@@ -866,6 +938,7 @@ impl Table {
+@@ -878,6 +956,7 @@ impl Table {
                  data,
                  size,
                  lazy_init,
@@ -533,7 +640,7 @@ index fceb5fc55cecbadd23ae58c75109710146ca6903..2b5b53e13f917c9c397ab3ae010186e9
              })) => (
                  unsafe { slice::from_raw_parts_mut(data.as_ptr().cast(), *size) },
                  *lazy_init,
-@@ -973,6 +1046,7 @@ impl Default for Table {
+@@ -985,6 +1064,7 @@ impl Default for Table {
              data: SendSyncPtr::new(NonNull::from(&mut [])),
              size: 0,
              lazy_init: false,
@@ -602,7 +709,7 @@ index 3fd7ddfcbc1b7be87c474bf4b48a60b4c69ed1ed..a89d6d40639c02928958557b5f2c8921
  ## GC and `externref`
  
 diff --git a/docs/contributing-release-process.md b/docs/contributing-release-process.md
-index 0646f66d54259f60aebb7e981889f0c088a054a4..200d337ba83691298fafa858b90cd8bc2d9c5f1c 100644
+index 2d44914643fcabcf3321aaf96e8e397c5ded041e..00d2cc228482662ad5db728ed7c6fcbe31a7bee1 100644
 --- a/docs/contributing-release-process.md
 +++ b/docs/contributing-release-process.md
 @@ -117,9 +117,11 @@ of criteria. It's done on an as-needed basis. Requirements, however, are:
@@ -639,7 +746,7 @@ index 30e9aea3e96c1e8e15cc6cfb7ba908db89e12b63..3e5ad37500e1d9f3d025d10d2db73d4a
  
  <!-- langtabs-start -->
 diff --git a/tests/all/call_hook.rs b/tests/all/call_hook.rs
-index 1041952e42c01641c408b4ff07a966071cb1fea6..5904e5ee5005fa91f2a60a20ed0d9cd6faa5c461 100644
+index 63de3509b7ea0613639120d0bfb216f62b6b0046..67988dfdbeeb09176afdd3a7775fb58d3767bf12 100644
 --- a/tests/all/call_hook.rs
 +++ b/tests/all/call_hook.rs
 @@ -321,6 +321,26 @@ fn instantiate() -> Result<(), Error> {
@@ -648,7 +755,7 @@ index 1041952e42c01641c408b4ff07a966071cb1fea6..5904e5ee5005fa91f2a60a20ed0d9cd6
  
 +    let table = Table::new(
 +        &mut store,
-+        TableType::new(RefType::FUNCREF, 1, None),
++        TableType::new(RefType::FUNCREF, 1, None)?,
 +        Ref::Func(None),
 +    )?;
 +    let m = Module::new(
@@ -670,7 +777,7 @@ index 1041952e42c01641c408b4ff07a966071cb1fea6..5904e5ee5005fa91f2a60a20ed0d9cd6
  }
  
 diff --git a/tests/all/memory_write_limits.rs b/tests/all/memory_write_limits.rs
-index 1392b32b80f4709e52fb92f8ee700c29a5b6ade2..26bdbd0918db6a35825bb0be46629d856b51bc6e 100644
+index ed651742d40a3664dfd8241008d633dbad3e421b..3f460a12965a4c26754cf71538ac9cdd272b85d1 100644
 --- a/tests/all/memory_write_limits.rs
 +++ b/tests/all/memory_write_limits.rs
 @@ -202,7 +202,10 @@ pub(crate) fn check_growth(strategy: wasmtime::Strategy) -> wasmtime::Result<()>
@@ -691,8 +798,8 @@ index 1392b32b80f4709e52fb92f8ee700c29a5b6ade2..26bdbd0918db6a35825bb0be46629d85
          .0 as usize;
 -    assert_eq!(serialized[offset], 2);
 -    for old_version in [0, 1] {
-+    assert_eq!(serialized[offset], 4);
-+    for old_version in [0, 1, 2, 3] {
++    assert_eq!(serialized[offset], 6);
++    for old_version in [0, 1, 2, 3, 4, 5] {
          let mut old = serialized.clone();
          old[offset] = old_version;
          let error = unsafe { Module::deserialize(&engine, old) }
@@ -776,21 +883,21 @@ index 1392b32b80f4709e52fb92f8ee700c29a5b6ade2..26bdbd0918db6a35825bb0be46629d85
      assert_eq!(&memory.data(&store)[4096..4098], &[6, 7]);
      memory.write(&mut store, 0, &[1, 2, 3, 4, 5])?;
 diff --git a/tests/all/metering_polling.rs b/tests/all/metering_polling.rs
-index cbd8121820157d41eebe453bf4953ba5ae189fb6..671bec14afe2d167f4accce831aae3a98dc78d1f 100644
+index c13e621657fc9f17e3a8a18ee034303702d05308..958ed757861545f6486cc345e42830bf6ec760ab 100644
 --- a/tests/all/metering_polling.rs
 +++ b/tests/all/metering_polling.rs
-@@ -610,7 +610,23 @@ fn polling_artifact_identity_and_metadata_versions() {
+@@ -614,7 +614,23 @@ fn polling_artifact_identity_and_metadata_versions() {
          let (offset, len) = section.file_range().unwrap();
          let offset = usize::try_from(offset).unwrap();
          let len = usize::try_from(len).unwrap();
 -        assert_eq!(artifact[offset], if interval == 0 { 2 } else { 3 });
-+        assert_eq!(artifact[offset], if interval == 0 { 4 } else { 5 });
++        assert_eq!(artifact[offset], if interval == 0 { 6 } else { 7 });
 +        let mut config = polling_config(interval);
 +        config
 +            .module_version(wasmtime::ModuleVersionStrategy::None)
 +            .unwrap();
 +        let consumer = Engine::new(&config).unwrap();
-+        for old_version in [2, 3] {
++        for old_version in [0, 1, 2, 3, 4, 5] {
 +            let mut old = artifact.clone();
 +            old[offset] = old_version;
 +            let error = unsafe { Module::deserialize(&consumer, &old) }.unwrap_err();
